@@ -18,6 +18,13 @@ import mujoco_scenes.mjcf
 import optax
 import xax
 from jaxtyping import Array, PRNGKeyArray
+from pathlib import Path
+
+import numpy as np
+from mujoco_animator.format import MjAnim
+
+from jaxtyping import Array, PRNGKeyArray, PyTree
+
 
 # These are in the order of the neural network outputs.
 ZEROS: list[tuple[str, float]] = [
@@ -42,6 +49,11 @@ ZEROS: list[tuple[str, float]] = [
     ("dof_left_knee_04", math.radians(50.0)),
     ("dof_left_ankle_02", math.radians(-30.0)),
 ]
+
+
+# Hand body names for computing hand positions
+LEFT_HAND_BODY_NAME = "KB_C_501X_Left_Bayonet_Adapter_Hard_Stop"
+RIGHT_HAND_BODY_NAME = "KB_C_501X_Right_Bayonet_Adapter_Hard_Stop"
 
 
 @dataclass
@@ -339,6 +351,14 @@ class Model(eqx.Module):
 
 
 class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
+    def __init__(self, config: HumanoidWalkingTaskConfig) -> None:
+        super().__init__(config)
+        
+        # Get hand body IDs - needed for computing hand positions in motion data
+        mj_model = self.get_mujoco_model()
+        self.hand_left_id = ksim.get_body_data_idx_from_name(mj_model, LEFT_HAND_BODY_NAME)
+        self.hand_right_id = ksim.get_body_data_idx_from_name(mj_model, RIGHT_HAND_BODY_NAME)
+
     def get_optimizer(self) -> optax.GradientTransformation:
         return (
             optax.adam(self.config.learning_rate)
@@ -368,6 +388,141 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             physics_model=physics_model,
             metadata=metadata,
         )
+
+    def get_qpos_from_file(self, filepath: Path) -> Array:
+        if filepath.suffix == ".npz":
+            npz = np.load(filepath, allow_pickle=True)
+            qpos = jnp.array(npz["qpos"])[400:] # skip first 200 frames
+            if float(npz["frequency"]) != 1 / self.config.ctrl_dt:
+                raise ValueError(f"Motion frequency {npz['frequency']} does not match ctrl_dt {self.config.ctrl_dt}")
+            return qpos
+        
+        from mujoco_animator.format import MjAnim
+        
+        # Load the JSON animation file
+        anim = MjAnim.load_json(filepath)
+        
+        # Convert to numpy array with proper time stepping
+        # This gives us shape (T, num_dofs) where T is number of timesteps
+        qpos = anim.to_numpy(dt=self.config.ctrl_dt, interp="linear", loop=True)
+        
+        # Verify the motion frequency matches our control timestep
+        # Calculate total duration from the animation frames
+        total_duration = sum(frame.length for frame in anim.frames)
+        expected_frames = int(total_duration / self.config.ctrl_dt)
+        print(f"Animation duration: {total_duration}s, Expected frames: {expected_frames}, Actual frames: {qpos.shape[0]}")
+        return qpos
+
+            
+
+    def get_real_motions(self, mj_model: mujoco.MjModel) -> PyTree:
+        """Loads a trajectory from a .npz file and converts it to the (batch, T, 20) tensor expected by AMP.
+
+        Expected keys inside the .npz:
+          • 'qpos'            –  (T, Nq)
+          • optional 'frequency' –  sampling Hz (used for verification)
+        """
+        
+        # traj_path = Path(__file__).parent / "gaits" / "cmu_walking_91.npz"
+        # traj_path = Path(__file__).parent / "gaits" / "dance_salsa.npz"
+        traj_path = Path(__file__).parent / "motions" / "basic_arm.json"
+        
+        qpos = self.get_qpos_from_file(traj_path)
+
+        # npz = np.load(traj_path, allow_pickle=True)
+        # qpos = jnp.array(npz["qpos"])[400:] # skip first 200 frames
+
+
+        # pos_limits = ksim.get_position_limits(mj_model)
+
+        # jnp.clip(arr, pos_limits)
+
+
+        # if float(npz["frequency"]) != 1 / self.config.ctrl_dt:
+        #     raise ValueError(f"Motion frequency {npz['frequency']} does not match ctrl_dt {self.config.ctrl_dt}")
+
+        # Create data for forward kinematics
+        mj_data = mujoco.MjData(mj_model)
+
+        # Compute hand positions for each timestep
+        t = qpos.shape[0]
+        hand_pos = np.zeros((t, 6))  # (T, [left_x, left_y, left_z, right_x, right_y, right_z])
+
+        for t in range(t):
+            # Set the qpos for this timestep
+            mj_data.qpos = qpos[t]
+            # Forward kinematics to compute body positions
+            mujoco.mj_forward(mj_model, mj_data)
+
+            # Get root position and orientation
+            root_pos = mj_data.xpos[0]  # Assuming root is at index 0
+
+            # Get hand positions in world frame
+            left_hand_world = mj_data.xpos[self.hand_left_id]
+            right_hand_world = mj_data.xpos[self.hand_right_id]
+
+            # Convert to root-relative positions
+            left_hand_rel = left_hand_world - root_pos
+            right_hand_rel = right_hand_world - root_pos
+
+            # Store local coordinates
+            hand_pos[t, 0:3] = left_hand_rel
+            hand_pos[t, 3:6] = right_hand_rel
+
+        # Convert to jax array and add batch dimension
+        hand_pos = jnp.array(hand_pos)[None]
+
+        joint_limits = ksim.get_position_limits(mj_model)
+        joint_names = ksim.get_joint_names_in_order(mj_model)
+
+        joint_mins = []
+        joint_maxs = []
+        for name in joint_names[1:]:  # skip freejoint
+            if name not in joint_limits:
+                raise KeyError(f"Joint '{name}' missing from joint limits dictionary")
+            j_min, j_max = joint_limits[name]
+            joint_mins.append(j_min)
+            joint_maxs.append(j_max)
+
+        joint_mins_arr = jnp.asarray(joint_mins)
+        joint_maxs_arr = jnp.asarray(joint_maxs)
+
+        # Separate freejoint (7) and articulated joints.
+        qpos_root = qpos[:, :7]
+        qpos_joints = qpos[:, 7:]
+
+        # Bring each angle into range by shifting with multiples of 2π.
+        two_pi = 2.0 * math.pi
+        center_arr = (joint_mins_arr + joint_maxs_arr) / 2.0  # (J,)
+
+        # Vectorised 2π-shifting about the joint-range centre.
+        qpos_orig = qpos_joints  # keep a copy for statistics
+        qpos_shifted = qpos_orig - jnp.round((qpos_orig - center_arr) / two_pi) * two_pi
+
+        # Final clipping (handles ranges narrower than 2π or numerical drift).
+        qpos_joints = jnp.clip(qpos_shifted, joint_mins_arr[None, :], joint_maxs_arr[None, :])
+
+        # Re-assemble the full qpos.
+        qpos = jnp.concatenate([qpos_root, qpos_joints], axis=-1)
+
+        qpos = qpos[None]
+
+        # Return both qpos and hand positions
+        return xax.FrozenDict({"qpos": qpos, "hand_pos": hand_pos})
+
+    def motion_to_qpos(self, motion: PyTree) -> Array:
+        """Converts a motion to `qpos` array.
+
+        This function is just used for replaying the motion on the robot model
+        for visualization purposes.
+
+        Args:
+            motion: The full motion, including the batch dimension.
+
+        Returns:
+            The `qpos` array, with shape (B, T, N).
+        """
+        return motion["qpos"]
 
     def get_physics_randomizers(self, physics_model: ksim.PhysicsModel) -> list[ksim.PhysicsRandomizer]:
         return [
