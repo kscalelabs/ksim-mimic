@@ -164,6 +164,66 @@ class StraightLegPenalty(JointPositionPenalty):
             scale_by_curriculum=scale_by_curriculum,
         )
 
+@attrs.define(frozen=True, kw_only=True)
+class TimeDependentReferenceMotionObservation(ksim.StatefulObservation):
+    """Reference motion observation."""
+
+    qpos_arr: xax.HashableArray
+    dt: float
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        physics_model: ksim.PhysicsModel,
+        qpos_arr: xax.HashableArray,
+        dt: float = 0.02,
+    ) -> Self:
+        return cls(qpos_arr=qpos_arr, dt=dt)
+
+    def observe_stateful(
+        self,
+        state: ksim.ObservationInput,
+        curriculum_level: Array,
+        rng: PRNGKeyArray,
+    ) -> tuple[Array, Array]:
+        t = jnp.atleast_1d(state.physics_state.data.time)
+
+        index = (t / self.dt).astype(jnp.int32)
+        # make the motion circular
+        index = jnp.mod(index + state.obs_carry, self.qpos_arr.array.shape[1])
+
+        qpos = self.qpos_arr.array[:, index, 7:]
+
+        return jnp.squeeze(qpos, axis=0).reshape(-1, 1), state.obs_carry
+
+    def initial_carry(self, physics_state: ksim.PhysicsState, rng: PRNGKeyArray) -> Array:
+        """Returns carry array [offset_idx]."""
+        offset_idx = jax.random.randint(rng, shape=(1,), minval=0, maxval=self.qpos_arr.array.shape[1], dtype=jnp.int32)
+        return offset_idx
+    
+
+@attrs.define(frozen=True)
+class ReferenceMotionReward(ksim.Reward):
+    """Reward for tracking the reference motion."""
+
+    reference_motion_obs_name: str = attrs.field(default="time_dependent_reference_motion_observation")
+    joint_scales: tuple[float, ...] = attrs.field(default=
+    (1.0, 1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0, 1.0,
+     0.5, 0.5, 0.5, 0.5, 0.5,
+     0.5, 0.5, 0.5, 0.5, 0.5))
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        reference_motion = trajectory.obs[self.reference_motion_obs_name]
+        reference_motion = jnp.squeeze(reference_motion, axis=-1)
+
+        joint_pos = trajectory.qpos[..., 7:]
+
+        # Compute the difference between the reference motion and the current joint positions
+        norm = xax.get_norm(reference_motion - joint_pos, norm="l2")
+        return (ksim.norm_to_reward(norm) * jnp.array(self.joint_scales)).sum(axis=-1)
+
 
 class Actor(eqx.Module):
     """Actor for the walking task."""
@@ -535,16 +595,16 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
 
     def get_events(self, physics_model: ksim.PhysicsModel) -> list[ksim.Event]:
         return [
-            ksim.PushEvent(
-                x_force=1.0,
-                y_force=1.0,
-                z_force=0.3,
-                force_range=(0.5, 1.0),
-                x_angular_force=0.0,
-                y_angular_force=0.0,
-                z_angular_force=0.0,
-                interval_range=(0.5, 4.0),
-            ),
+            # ksim.PushEvent(
+            #     x_force=1.0,
+            #     y_force=1.0,
+            #     z_force=0.3,
+            #     force_range=(0.5, 1.0),
+            #     x_angular_force=0.0,
+            #     y_angular_force=0.0,
+            #     z_angular_force=0.0,
+            #     interval_range=(0.5, 4.0),
+            # ),
         ]
 
     def get_resets(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reset]:
@@ -584,6 +644,10 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 sensor_name="imu_gyro",
                 noise=math.radians(10),
             ),
+            TimeDependentReferenceMotionObservation.create(
+                physics_model=physics_model,
+                qpos_arr=xax.HashableArray(self.get_real_motions(self.get_mujoco_model())["qpos"]),
+            ),
         ]
 
     def get_commands(self, physics_model: ksim.PhysicsModel) -> list[ksim.Command]:
@@ -591,24 +655,26 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
 
     def get_rewards(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reward]:
         return [
-            # Standard rewards.
-            ksim.NaiveForwardReward(clip_max=1.25, in_robot_frame=False, scale=3.0),
-            ksim.NaiveForwardOrientationReward(scale=1.0),
-            ksim.StayAliveReward(scale=1.0),
-            ksim.UprightReward(scale=0.5),
-            # Avoid movement penalties.
-            ksim.AngularVelocityPenalty(index=("x", "y"), scale=-0.1),
-            ksim.LinearVelocityPenalty(index=("z"), scale=-0.1),
-            # Normalization penalties.
-            ksim.AvoidLimitsPenalty.create(physics_model, scale=-0.01),
-            ksim.JointAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            ksim.JointJerkPenalty(scale=-0.01, scale_by_curriculum=True),
-            ksim.LinkAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            ksim.LinkJerkPenalty(scale=-0.01, scale_by_curriculum=True),
-            ksim.ActionAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            # Bespoke rewards.
-            BentArmPenalty.create_penalty(physics_model, scale=-0.1),
-            StraightLegPenalty.create_penalty(physics_model, scale=-0.1),
+            ksim.StayAliveReward(scale=10.0),
+            ReferenceMotionReward(scale=1.0),
+            # # Standard rewards.
+            # ksim.NaiveForwardReward(clip_max=1.25, in_robot_frame=False, scale=3.0),
+            # ksim.NaiveForwardOrientationReward(scale=1.0),
+            # ksim.StayAliveReward(scale=1.0),
+            # ksim.UprightReward(scale=0.5),
+            # # Avoid movement penalties.
+            # ksim.AngularVelocityPenalty(index=("x", "y"), scale=-0.1),
+            # ksim.LinearVelocityPenalty(index=("z"), scale=-0.1),
+            # # Normalization penalties.
+            # ksim.AvoidLimitsPenalty.create(physics_model, scale=-0.01),
+            # ksim.JointAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
+            # ksim.JointJerkPenalty(scale=-0.01, scale_by_curriculum=True),
+            # ksim.LinkAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
+            # ksim.LinkJerkPenalty(scale=-0.01, scale_by_curriculum=True),
+            # ksim.ActionAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
+            # # Bespoke rewards.
+            # BentArmPenalty.create_penalty(physics_model, scale=-0.1),
+            # StraightLegPenalty.create_penalty(physics_model, scale=-0.1),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
@@ -649,6 +715,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         proj_grav_3 = observations["projected_gravity_observation"]
         imu_acc_3 = observations["sensor_observation_imu_acc"]
         imu_gyro_3 = observations["sensor_observation_imu_gyro"]
+        ref_motion = observations["time_dependent_reference_motion_observation"]
 
         obs = [
             jnp.sin(time_1),
@@ -686,6 +753,8 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         act_frc_obs_n = observations["actuator_force_observation"]
         base_pos_3 = observations["base_position_observation"]
         base_quat_4 = observations["base_orientation_observation"]
+        
+        ref_motion = observations["time_dependent_reference_motion_observation"]
 
         obs_n = jnp.concatenate(
             [
