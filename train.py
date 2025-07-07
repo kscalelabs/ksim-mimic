@@ -381,23 +381,23 @@ class MimicJointVelocityReward(ksim.Reward):
 class MimicEEPoseReward(ksim.Reward):
     left_hand_body_id:  int
     right_hand_body_id: int
-
-    # observation key the reference EE positions live under
-    ref_ee_name: str = "time_dependent_ref_ee_pos"
+    ref_ee_name: str = "time_dependent_ref_eepos"
+    alpha: float = 10.0          # tracking sharpness, not a global weight
 
     @property
-    def ee_ids(self):          # (left,right)
+    def ee_ids(self):
         return (self.left_hand_body_id, self.right_hand_body_id)
 
     def get_reward(self, traj: ksim.Trajectory) -> Array:
         if self.ref_ee_name not in traj.obs:
             return jnp.zeros(traj.done.shape)
 
-        ee_pos  = traj.xpos[..., self.ee_ids, :]                       # (B,2,3)
-        ref_pos = traj.obs[self.ref_ee_name].reshape(*ee_pos.shape)    # (B,2,3)
+        root_pos = traj.xpos[..., 0, :]                             # (B,3)
+        ee_cur   = traj.xpos[..., self.ee_ids, :] - root_pos[:, None, :]
+        ee_ref   = traj.obs[self.ref_ee_name].reshape(*ee_cur.shape)
 
-        err = jnp.linalg.norm(ref_pos - ee_pos, axis=-1).sum(-1)
-        r   = jnp.exp(-40.0 * err)
+        error = jnp.linalg.norm(ee_ref - ee_cur, axis=-1).mean(-1)    # (B,)
+        r   = jnp.exp(-self.alpha * error)                            # no extra scale
         return jnp.broadcast_to(r, traj.done.shape)
 
 
