@@ -19,6 +19,7 @@ import optax
 import xax
 from jaxtyping import Array, PRNGKeyArray
 from pathlib import Path
+import logging
 
 import numpy as np
 from mujoco_animator.format import MjAnim
@@ -224,6 +225,14 @@ class CurrentJointVelocityObservation(ksim.Observation):
         qvel_j = state.physics_state.data.qvel[6:]
         omega   = hinge_speed_to_omega(qvel_j, self.hinge_axes.array)  # (J,3)
         return omega.reshape(-1)                                       
+
+@attrs.define(frozen=True)
+class ReferenceMotionPhaseObservation(ksim.Observation):
+    cycle_period: float      # seconds
+
+    def observe(self, state, *_):
+        t = jnp.atleast_1d(state.physics_state.data.time)               # (scalar or B,)
+        return (t % self.cycle_period) / self.cycle_period
 
 @attrs.define(frozen=True, kw_only=True)
 class TimeDependentReferenceMotionObservation(ksim.StatefulObservation):
@@ -609,12 +618,14 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         super().__init__(config)
         
         # Get hand body IDs - needed for computing hand positions in motion data
-        mj_model = self.get_mujoco_model()
-        self.hinge_axes = self._get_joint_axes_in_order(mj_model)
-        self.hand_left_id = ksim.get_body_data_idx_from_name(mj_model, LEFT_HAND_BODY_NAME)
-        self.hand_right_id = ksim.get_body_data_idx_from_name(mj_model, RIGHT_HAND_BODY_NAME)
+        self.mj_model = self.get_mujoco_model()
+        self.hinge_axes = self._get_joint_axes_in_order(self.mj_model)
+        self.hand_left_id = ksim.get_body_data_idx_from_name(self.mj_model, LEFT_HAND_BODY_NAME)
+        self.hand_right_id = ksim.get_body_data_idx_from_name(self.mj_model, RIGHT_HAND_BODY_NAME)
 
-        self.real_motion = self.get_real_motions(mj_model)   # FrozenDict with qpos/quat/omega/hand_pos
+        self.real_motion = self.get_real_motions(self.mj_model)   # FrozenDict with qpos/quat/omega/hand_pos
+        self.cycle_period = self.real_motion["qpos"].shape[1] * self.config.ctrl_dt
+
 
 
     def get_optimizer(self) -> optax.GradientTransformation:
@@ -679,7 +690,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         # Calculate total duration from the animation frames
         total_duration = sum(frame.length for frame in anim.frames)
         expected_frames = int(total_duration / self.config.ctrl_dt)
-        print(f"Animation duration: {total_duration}s, Expected frames: {expected_frames}, Actual frames: {qpos.shape[0]}")
+        logging.info("Animation duration: %.3fs, Expected frames: %d, Actual frames: %d" % (total_duration, expected_frames, qpos.shape[0]))
         return qpos
 
             
@@ -907,11 +918,12 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 sensor_name="imu_gyro",
                 noise=math.radians(10),
             ),
-            CurrentQuatObservation.create(mj_model=self.get_mujoco_model()),
-            CurrentJointVelocityObservation.create(mj_model=self.get_mujoco_model()),
+            CurrentQuatObservation.create(mj_model=self.mj_model),
+            CurrentJointVelocityObservation.create(mj_model=self.mj_model),
+            ReferenceMotionPhaseObservation(cycle_period=self.cycle_period),
             TimeDependentReferenceMotionObservation.create(
                 physics_model=physics_model,
-                qpos_arr=xax.HashableArray(self.get_real_motions(self.get_mujoco_model())["qpos"]),
+                qpos_arr=xax.HashableArray(self.real_motion["qpos"]),
             ),
             TimeDependentRefQuat(
                 quat_arr=xax.HashableArray(self.real_motion["quat"]),
@@ -981,9 +993,9 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
     def get_model(self, key: PRNGKeyArray) -> Model:
         return Model(
             key,
-            num_actor_inputs=51 if self.config.use_acc_gyro else 45,
+            num_actor_inputs=50 if self.config.use_acc_gyro else 44,
             num_actor_outputs=len(ZEROS),
-            num_critic_inputs=446,
+            num_critic_inputs=445,
             min_std=0.001,
             max_std=1.0,
             var_scale=self.config.var_scale,
@@ -999,7 +1011,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         commands: xax.FrozenDict[str, Array],
         carry: Array,
     ) -> tuple[distrax.Distribution, Array]:
-        time_1 = observations["timestep_observation"]
+        phase_1 = observations["reference_motion_phase_observation"]
         joint_pos_n = observations["joint_position_observation"]
         joint_vel_n = observations["joint_velocity_observation"]
         proj_grav_3 = observations["projected_gravity_observation"]
@@ -1008,8 +1020,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         ref_motion = observations["time_dependent_reference_motion_observation"]
 
         obs = [
-            jnp.sin(time_1),
-            jnp.cos(time_1),
+            phase_1,        # 1
             joint_pos_n,  # NUM_JOINTS
             joint_vel_n,  # NUM_JOINTS
             proj_grav_3,  # 3
@@ -1032,7 +1043,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         commands: xax.FrozenDict[str, Array],
         carry: Array,
     ) -> tuple[Array, Array]:
-        time_1 = observations["timestep_observation"]
+        phase_1 = observations["reference_motion_phase_observation"]
         dh_joint_pos_j = observations["joint_position_observation"]
         dh_joint_vel_j = observations["joint_velocity_observation"]
         com_inertia_n = observations["center_of_mass_inertia_observation"]
@@ -1048,8 +1059,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
 
         obs_n = jnp.concatenate(
             [
-                jnp.sin(time_1),
-                jnp.cos(time_1),
+                phase_1,           # 1
                 dh_joint_pos_j,  # NUM_JOINTS
                 dh_joint_vel_j / 10.0,  # NUM_JOINTS
                 com_inertia_n,  # 160
