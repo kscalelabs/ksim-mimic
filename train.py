@@ -319,55 +319,68 @@ class ReferenceMotionReward(ksim.Reward):
         return (ksim.norm_to_reward(norm) * jnp.array(self.joint_scales)).sum(axis=-1)
 
 
+# ---------- 1. joint-orientation (quaternion) ------------------------------
 @attrs.define(frozen=True)
-class DeepMimicImitationReward(ksim.Reward):
+class MimicJointOrientationReward(ksim.Reward):
+    quat_ref_name: str = "time_dependent_ref_quat"
+    quat_cur_name: str = "current_quat_observation"
+
+    def get_reward(self, traj: ksim.Trajectory) -> Array:
+        ref = traj.obs[self.quat_ref_name].reshape(*traj.obs[self.quat_cur_name].shape)
+        cur = traj.obs[self.quat_cur_name]
+
+        err = jnp.linalg.norm(ref - cur, axis=-1).sum(-1)
+        r   = jnp.exp(-2.0 * err)
+        return jnp.broadcast_to(r, traj.done.shape)        # 1-liner broadcast
+
+
+# ---------- 2. joint-angular-velocity --------------------------------------
+@attrs.define(frozen=True)
+class MimicJointVelocityReward(ksim.Reward):
+    vel_ref_name: str = "time_dependent_ref_vel"
+    vel_cur_name: str = "current_joint_velocity_observation"
+
+    def get_reward(self, traj: ksim.Trajectory) -> Array:
+        ref = traj.obs[self.vel_ref_name].reshape(*traj.obs[self.vel_cur_name].shape)
+        cur = traj.obs[self.vel_cur_name]
+
+        err = jnp.linalg.norm(ref - cur, axis=-1).sum(-1)
+        r   = jnp.exp(-0.1 * err)
+        return jnp.broadcast_to(r, traj.done.shape)
+
+
+# ---------- 3. end-effector pose -------------------------------------------
+@attrs.define(frozen=True)
+class MimicEEPoseReward(ksim.Reward):
     left_hand_body_id:  int
     right_hand_body_id: int
-    quat_ref_name: str = "time_dependent_ref_quat"
-    vel_ref_name: str = "time_dependent_ref_vel"
-    quat_cur_name: str = "current_quat_observation"
-    vel_cur_name: str = "current_joint_velocity_observation"
-    pose_w: float = 0.65
-    vel_w:  float = 0.10
-    ee_w:   float = 0.15
-    com_w:  float = 0.10
 
     @property
     def ee_ids(self):          # (left,right)
         return (self.left_hand_body_id, self.right_hand_body_id)
 
     def get_reward(self, traj: ksim.Trajectory) -> Array:
-        # --- pose & velocity terms ------------------------------------------
-        ref_q  = traj.obs[self.quat_ref_name] .reshape(*traj.obs[self.quat_cur_name].shape)
-        ref_w  = traj.obs[self.vel_ref_name].reshape(*traj.obs[self.vel_cur_name].shape)
-        act_q  = traj.obs[self.quat_cur_name]
-        act_w  = traj.obs[self.vel_cur_name]
+        if "ref_ee_pos" not in traj.obs:
+            return jnp.zeros(traj.done.shape)
 
-        pose_err = jnp.linalg.norm(ref_q - act_q, axis=-1).sum(-1)
-        vel_err  = jnp.linalg.norm(ref_w - act_w, axis=-1).sum(-1)
-        pose_r = jnp.exp(-2.0 * pose_err)
-        vel_r  = jnp.exp(-0.1 * vel_err)
+        ee_pos  = traj.xpos[..., self.ee_ids, :]                # (B,2,3)
+        ref_pos = traj.obs["ref_ee_pos"].reshape(*ee_pos.shape)
 
-        # --- end-effector & COM terms (optional) -----------------------------
-        ee_r, com_r = 0.0, 0.0
-        if "ref_ee_pos" in traj.obs:
-            ee_pos    = traj.xpos[..., self.ee_ids, :]                  # (B,2,3)
-            ref_eepos = traj.obs["ref_ee_pos"].reshape(*ee_pos.shape)
-            ee_err = jnp.linalg.norm(ref_eepos - ee_pos, axis=-1).sum(-1)
-            ee_r  = jnp.exp(-40.0 * ee_err)
+        err = jnp.linalg.norm(ref_pos - ee_pos, axis=-1).sum(-1)
+        r   = jnp.exp(-40.0 * err)
+        return jnp.broadcast_to(r, traj.done.shape)
 
-        if "ref_com" in traj.obs:
-            com_err = jnp.linalg.norm(traj.obs["ref_com"] - traj.com_pos, axis=-1)
-            com_r   = jnp.exp(-10.0 * com_err)
 
-        reward = (self.pose_w * pose_r +
-                self.vel_w  * vel_r  +
-                self.ee_w   * ee_r   +
-                self.com_w  * com_r)
+# ---------- 4. centre-of-mass tracking -------------------------------------
+@attrs.define(frozen=True)
+class MimicCOMReward(ksim.Reward):
+    def get_reward(self, traj: ksim.Trajectory) -> Array:
+        if "ref_com" not in traj.obs:
+            return jnp.zeros(traj.done.shape)
 
-        reward = jnp.broadcast_to(reward, traj.done.shape)
-        
-        return reward
+        err = jnp.linalg.norm(traj.obs["ref_com"] - traj.com_pos, axis=-1)
+        r   = jnp.exp(-10.0 * err)
+        return jnp.broadcast_to(r, traj.done.shape)
 
 class Actor(eqx.Module):
     """Actor for the walking task."""
@@ -865,7 +878,15 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         return [
             ksim.StayAliveReward(scale=10.0),
             # ReferenceMotionReward(scale=1.0),
-            DeepMimicImitationReward(scale=1.0, left_hand_body_id=self.hand_left_id, right_hand_body_id=self.hand_right_id),
+            # ----- Deep-Mimic imitation terms (now split) ----------------------
+            MimicJointOrientationReward(scale=0.65),                 # pose   w = 0.65
+            MimicJointVelocityReward(scale=0.10),                    # velocity w = 0.10
+            MimicEEPoseReward(                                       
+                left_hand_body_id=self.hand_left_id,
+                right_hand_body_id=self.hand_right_id,
+                scale=0.15,                                          # EE       w = 0.15
+            ),
+            MimicCOMReward(scale=0.10),                              # COM      w = 0.10
             # # Standard rewards.
             # ksim.NaiveForwardReward(clip_max=1.25, in_robot_frame=False, scale=3.0),
             # ksim.NaiveForwardOrientationReward(scale=1.0),
