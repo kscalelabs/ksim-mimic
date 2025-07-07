@@ -295,6 +295,33 @@ class TimeDependentRefVel(ksim.StatefulObservation):
     def initial_carry(self, physics_state, rng):
         return jax.random.randint(rng, (1,), 0,
                                   self.omega_arr.array.shape[1], dtype=jnp.int32)
+
+@attrs.define(frozen=True, kw_only=True)
+class TimeDependentRefEEPos(ksim.StatefulObservation):
+    ee_arr: xax.HashableArray   # (1,T,6)  –  [lx,ly,lz, rx,ry,rz]
+    dt: float = 0.02
+    def observe_stateful(self, state, _, __):
+        t   = jnp.atleast_1d(state.physics_state.data.time)
+        idx = jnp.mod((t / self.dt).astype(jnp.int32) + state.obs_carry,
+                      self.ee_arr.array.shape[1])
+        ee  = self.ee_arr.array[:, idx]        # (1,1,6)
+        return ee.reshape(-1), state.obs_carry
+    def initial_carry(self, _, rng):
+        return jax.random.randint(rng, (1,), 0, self.ee_arr.array.shape[1], jnp.int32)
+
+
+@attrs.define(frozen=True, kw_only=True)
+class TimeDependentRefCOM(ksim.StatefulObservation):
+    com_arr: xax.HashableArray   # (1,T,3)
+    dt: float = 0.02
+    def observe_stateful(self, state, _, __):
+        t   = jnp.atleast_1d(state.physics_state.data.time)
+        idx = jnp.mod((t / self.dt).astype(jnp.int32) + state.obs_carry,
+                      self.com_arr.array.shape[1])
+        com = self.com_arr.array[:, idx]       # (1,1,3)
+        return com.reshape(-1), state.obs_carry
+    def initial_carry(self, _, rng):
+        return jax.random.randint(rng, (1,), 0, self.com_arr.array.shape[1], jnp.int32)
     
 
 @attrs.define(frozen=True)
@@ -355,30 +382,40 @@ class MimicEEPoseReward(ksim.Reward):
     left_hand_body_id:  int
     right_hand_body_id: int
 
+    # observation key the reference EE positions live under
+    ref_ee_name: str = "time_dependent_ref_ee_pos"
+
     @property
     def ee_ids(self):          # (left,right)
         return (self.left_hand_body_id, self.right_hand_body_id)
 
     def get_reward(self, traj: ksim.Trajectory) -> Array:
-        if "ref_ee_pos" not in traj.obs:
+        if self.ref_ee_name not in traj.obs:
             return jnp.zeros(traj.done.shape)
 
-        ee_pos  = traj.xpos[..., self.ee_ids, :]                # (B,2,3)
-        ref_pos = traj.obs["ref_ee_pos"].reshape(*ee_pos.shape)
+        ee_pos  = traj.xpos[..., self.ee_ids, :]                       # (B,2,3)
+        ref_pos = traj.obs[self.ref_ee_name].reshape(*ee_pos.shape)    # (B,2,3)
 
         err = jnp.linalg.norm(ref_pos - ee_pos, axis=-1).sum(-1)
         r   = jnp.exp(-40.0 * err)
         return jnp.broadcast_to(r, traj.done.shape)
 
 
-# ---------- 4. centre-of-mass tracking -------------------------------------
+# ---------- 4. centre-of-mass (root) tracking ------------------------------
 @attrs.define(frozen=True)
 class MimicCOMReward(ksim.Reward):
+    ref_com_name: str = "time_dependent_ref_com"      # reference traj key
+    cur_com_name: str = "base_position_observation"   # current robot root pos
+
     def get_reward(self, traj: ksim.Trajectory) -> Array:
-        if "ref_com" not in traj.obs:
+        # make sure both obs exist
+        if self.ref_com_name not in traj.obs or self.cur_com_name not in traj.obs:
             return jnp.zeros(traj.done.shape)
 
-        err = jnp.linalg.norm(traj.obs["ref_com"] - traj.com_pos, axis=-1)
+        ref = traj.obs[self.ref_com_name].reshape(*traj.obs[self.cur_com_name].shape)
+        cur = traj.obs[self.cur_com_name]                       # (B,3)
+
+        err = jnp.linalg.norm(ref - cur, axis=-1)               # (B,)
         r   = jnp.exp(-10.0 * err)
         return jnp.broadcast_to(r, traj.done.shape)
 
@@ -679,6 +716,8 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         # Compute hand positions for each timestep
         t = qpos.shape[0]
         hand_pos = np.zeros((t, 6))  # (T, [left_x, left_y, left_z, right_x, right_y, right_z])
+        hand_abs = np.zeros((t, 6))  # absolute hand positions
+        com_world = np.zeros((t, 3))  # center-of-mass positions
 
         for t in range(t):
             # Set the qpos for this timestep
@@ -701,8 +740,19 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             hand_pos[t, 0:3] = left_hand_rel
             hand_pos[t, 3:6] = right_hand_rel
 
+            # --- NEW: absolute hand positions (world frame) --------------------------
+            left_hand_w  = mj_data.xpos[self.hand_left_id].copy()
+            right_hand_w = mj_data.xpos[self.hand_right_id].copy()
+            hand_abs[t, 0:3] = left_hand_w          # (T,6)
+            hand_abs[t, 3:6] = right_hand_w
+
+            # --- NEW: centre-of-mass position (world) --------------------------------
+            com_world[t] = mj_data.subtree_com[0]    # (T,3)
+
         # Convert to jax array and add batch dimension
         hand_pos = jnp.array(hand_pos)[None]
+        hand_abs  = jnp.array(hand_abs)[None]     # (1,T,6)
+        com_world = jnp.array(com_world)[None]    # (1,T,3)
 
         joint_limits = ksim.get_position_limits(mj_model)
         joint_names = ksim.get_joint_names_in_order(mj_model)
@@ -776,9 +826,11 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         # --------------------------------------------
         return xax.FrozenDict({
             "qpos"      : qpos,      # (1, T, Nq)
-            "hand_pos"  : hand_pos,  # (1, T, 6)
+            "hand_pos"  : hand_pos,  # (1, T, 6) - root-relative
+            "hand_abs"  : hand_abs,  # (1, T, 6) - absolute world frame
             "quat"      : quat,      # (1, T, J, 4)   ### NEW
             "omega"     : omega,     # (1, T, J, 3)   ### NEW
+            "com"       : com_world, # (1, T, 3) - center of mass world frame
         })
 
     def motion_to_qpos(self, motion: PyTree) -> Array:
@@ -867,6 +919,14 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             ),
             TimeDependentRefVel(
                 omega_arr=xax.HashableArray(self.real_motion["omega"]),
+                dt=self.config.ctrl_dt,
+            ),
+            TimeDependentRefEEPos(
+                ee_arr=xax.HashableArray(self.real_motion["hand_pos"]),
+                dt=self.config.ctrl_dt,
+            ),
+            TimeDependentRefCOM(
+                com_arr=xax.HashableArray(self.real_motion["com"]),
                 dt=self.config.ctrl_dt,
             ),
         ]
