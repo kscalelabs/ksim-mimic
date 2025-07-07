@@ -356,7 +356,7 @@ class MimicJointOrientationReward(ksim.Reward):
         ref = traj.obs[self.quat_ref_name].reshape(*traj.obs[self.quat_cur_name].shape)
         cur = traj.obs[self.quat_cur_name]
 
-        err = jnp.linalg.norm(ref - cur, axis=-1).sum(-1)
+        err = jnp.linalg.norm(ref - cur, axis=-1)
         r   = jnp.exp(-2.0 * err)
         return jnp.broadcast_to(r, traj.done.shape)        # 1-liner broadcast
 
@@ -371,7 +371,7 @@ class MimicJointVelocityReward(ksim.Reward):
         ref = traj.obs[self.vel_ref_name].reshape(*traj.obs[self.vel_cur_name].shape)
         cur = traj.obs[self.vel_cur_name]
 
-        err = jnp.linalg.norm(ref - cur, axis=-1).sum(-1)
+        err = jnp.linalg.norm(ref - cur, axis=-1)
         r   = jnp.exp(-0.1 * err)
         return jnp.broadcast_to(r, traj.done.shape)
 
