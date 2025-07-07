@@ -2,8 +2,10 @@
 
 import asyncio
 import functools
+import logging
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Self
 
 import attrs
@@ -15,50 +17,44 @@ import ksim
 import mujoco
 import mujoco_scenes
 import mujoco_scenes.mjcf
+import numpy as np
 import optax
 import xax
-from jaxtyping import Array, PRNGKeyArray
-from pathlib import Path
-import logging
-
-import numpy as np
-from mujoco_animator.format import MjAnim
-
 from jaxtyping import Array, PRNGKeyArray, PyTree
+from mujoco_animator.format import MjAnim
 
 
 def hinge_angle_to_quat(theta_rad: jnp.ndarray, axis: jnp.ndarray) -> jnp.ndarray:
-    """
-    theta_rad : (..., J)   angles
+    """theta_rad : (..., J)   angles
     axis      : (J, 3)     unit axes (parent frame)
     returns   : (..., J, 4)
     """
-    theta_rad = jnp.atleast_2d(theta_rad)        # ensure leading “time” dim
-    half = 0.5 * theta_rad                       # (..., J)
-    w    = jnp.cos(half)[..., None]              # (..., J, 1)
-    xyz  = jnp.sin(half)[..., None] * axis       # broadcast (..., J, 3)
-    return jnp.concatenate([w, xyz], axis=-1)    # (..., J, 4)
+    theta_rad = jnp.atleast_2d(theta_rad)  # ensure leading “time” dim
+    half = 0.5 * theta_rad  # (..., J)
+    w = jnp.cos(half)[..., None]  # (..., J, 1)
+    xyz = jnp.sin(half)[..., None] * axis  # broadcast (..., J, 3)
+    return jnp.concatenate([w, xyz], axis=-1)  # (..., J, 4)
 
 
 def hinge_speed_to_omega(theta_dot: jnp.ndarray, axis: jnp.ndarray) -> jnp.ndarray:
-    """
-    theta_dot : (..., J)   angular speeds
+    """theta_dot : (..., J)   angular speeds
     axis      : (J, 3)
     returns   : (..., J, 3)
     """
     theta_dot = jnp.atleast_2d(theta_dot)
-    return theta_dot[..., None] * axis           # broadcast (..., J, 3)
+    return theta_dot[..., None] * axis  # broadcast (..., J, 3)
+
 
 def _get_joint_axes_in_order(mj_model: mujoco.MjModel) -> jnp.ndarray:
-    """
-    Returns array shape (num_hinge, 3) whose rows are each hinge's unit axis
+    """Returns array shape (num_hinge, 3) whose rows are each hinge's unit axis
     in the **parent** frame, ordered exactly like qpos[7:] / qvel[6:].
     """
     hinge_axes = []
     for j_id in range(mj_model.njnt):
         if mj_model.jnt_type[j_id] == mujoco.mjtJoint.mjJNT_HINGE:
             hinge_axes.append(mj_model.jnt_axis[j_id])
-    return jnp.asarray(hinge_axes)          # (num_hinge, 3)
+    return jnp.asarray(hinge_axes)  # (num_hinge, 3)
+
 
 # These are in the order of the neural network outputs.
 ZEROS: list[tuple[str, float]] = [
@@ -197,7 +193,8 @@ class StraightLegPenalty(JointPositionPenalty):
             scale=scale,
             scale_by_curriculum=scale_by_curriculum,
         )
-        
+
+
 @attrs.define(frozen=True, kw_only=True)
 class CurrentQuatObservation(ksim.Observation):
     hinge_axes: xax.HashableArray
@@ -209,8 +206,9 @@ class CurrentQuatObservation(ksim.Observation):
 
     def observe(self, state, curriculum_level, rng):
         qpos_j = state.physics_state.data.qpos[7:]
-        quat    = hinge_angle_to_quat(qpos_j, self.hinge_axes.array)  # (J,4)
-        return quat.reshape(-1)                                       # flat (4 × J,)
+        quat = hinge_angle_to_quat(qpos_j, self.hinge_axes.array)  # (J,4)
+        return quat.reshape(-1)  # flat (4 × J,)
+
 
 @attrs.define(frozen=True, kw_only=True)
 class CurrentJointVelocityObservation(ksim.Observation):
@@ -223,16 +221,18 @@ class CurrentJointVelocityObservation(ksim.Observation):
 
     def observe(self, state, curriculum_level, rng):
         qvel_j = state.physics_state.data.qvel[6:]
-        omega   = hinge_speed_to_omega(qvel_j, self.hinge_axes.array)  # (J,3)
-        return omega.reshape(-1)                                       
+        omega = hinge_speed_to_omega(qvel_j, self.hinge_axes.array)  # (J,3)
+        return omega.reshape(-1)
+
 
 @attrs.define(frozen=True)
 class ReferenceMotionPhaseObservation(ksim.Observation):
-    cycle_period: float      # seconds
+    cycle_period: float  # seconds
 
     def observe(self, state, *_):
-        t = jnp.atleast_1d(state.physics_state.data.time)               # (scalar or B,)
+        t = jnp.atleast_1d(state.physics_state.data.time)  # (scalar or B,)
         return (t % self.cycle_period) / self.cycle_period
+
 
 @attrs.define(frozen=True, kw_only=True)
 class TimeDependentReferenceMotionObservation(ksim.StatefulObservation):
@@ -272,77 +272,75 @@ class TimeDependentReferenceMotionObservation(ksim.StatefulObservation):
         offset_idx = jax.random.randint(rng, shape=(1,), minval=0, maxval=self.qpos_arr.array.shape[1], dtype=jnp.int32)
         return offset_idx
 
+
 @attrs.define(frozen=True, kw_only=True)
 class TimeDependentRefQuat(ksim.StatefulObservation):
-    quat_arr: xax.HashableArray           # (1, T, J, 4)
+    quat_arr: xax.HashableArray  # (1, T, J, 4)
     dt: float = 0.02
 
     def observe_stateful(self, state, curriculum_level, rng):
-        t   = jnp.atleast_1d(state.physics_state.data.time)
-        idx = jnp.mod((t / self.dt).astype(jnp.int32) + state.obs_carry,
-                      self.quat_arr.array.shape[1])
-        quat = self.quat_arr.array[:, idx]                # (1, 1, J, 4)
-        return quat.reshape(-1), state.obs_carry          # flat 4*J
+        t = jnp.atleast_1d(state.physics_state.data.time)
+        idx = jnp.mod((t / self.dt).astype(jnp.int32) + state.obs_carry, self.quat_arr.array.shape[1])
+        quat = self.quat_arr.array[:, idx]  # (1, 1, J, 4)
+        return quat.reshape(-1), state.obs_carry  # flat 4*J
 
     def initial_carry(self, physics_state, rng):
-        return jax.random.randint(rng, (1,), 0,
-                                  self.quat_arr.array.shape[1], dtype=jnp.int32)
+        return jax.random.randint(rng, (1,), 0, self.quat_arr.array.shape[1], dtype=jnp.int32)
 
 
 @attrs.define(frozen=True, kw_only=True)
 class TimeDependentRefVel(ksim.StatefulObservation):
-    omega_arr: xax.HashableArray          # (1, T, J, 3)
+    omega_arr: xax.HashableArray  # (1, T, J, 3)
     dt: float = 0.02
 
     def observe_stateful(self, state, curriculum_level, rng):
-        t   = jnp.atleast_1d(state.physics_state.data.time)
-        idx = jnp.mod((t / self.dt).astype(jnp.int32) + state.obs_carry,
-                      self.omega_arr.array.shape[1])
-        omega = self.omega_arr.array[:, idx]              # (1, 1, J, 3)
-        return omega.reshape(-1), state.obs_carry         # flat 3*J
+        t = jnp.atleast_1d(state.physics_state.data.time)
+        idx = jnp.mod((t / self.dt).astype(jnp.int32) + state.obs_carry, self.omega_arr.array.shape[1])
+        omega = self.omega_arr.array[:, idx]  # (1, 1, J, 3)
+        return omega.reshape(-1), state.obs_carry  # flat 3*J
 
     def initial_carry(self, physics_state, rng):
-        return jax.random.randint(rng, (1,), 0,
-                                  self.omega_arr.array.shape[1], dtype=jnp.int32)
+        return jax.random.randint(rng, (1,), 0, self.omega_arr.array.shape[1], dtype=jnp.int32)
+
 
 @attrs.define(frozen=True, kw_only=True)
 class TimeDependentRefEEPos(ksim.StatefulObservation):
-    ee_arr: xax.HashableArray   # (1,T,6)  –  [lx,ly,lz, rx,ry,rz]
+    ee_arr: xax.HashableArray  # (1,T,6)  –  [lx,ly,lz, rx,ry,rz]
     dt: float = 0.02
+
     def observe_stateful(self, state, _, __):
-        t   = jnp.atleast_1d(state.physics_state.data.time)
-        idx = jnp.mod((t / self.dt).astype(jnp.int32) + state.obs_carry,
-                      self.ee_arr.array.shape[1])
-        ee  = self.ee_arr.array[:, idx]        # (1,1,6)
+        t = jnp.atleast_1d(state.physics_state.data.time)
+        idx = jnp.mod((t / self.dt).astype(jnp.int32) + state.obs_carry, self.ee_arr.array.shape[1])
+        ee = self.ee_arr.array[:, idx]  # (1,1,6)
         return ee.reshape(-1), state.obs_carry
+
     def initial_carry(self, _, rng):
         return jax.random.randint(rng, (1,), 0, self.ee_arr.array.shape[1], jnp.int32)
 
 
 @attrs.define(frozen=True, kw_only=True)
 class TimeDependentRefCOM(ksim.StatefulObservation):
-    com_arr: xax.HashableArray   # (1,T,3)
+    com_arr: xax.HashableArray  # (1,T,3)
     dt: float = 0.02
+
     def observe_stateful(self, state, _, __):
-        t   = jnp.atleast_1d(state.physics_state.data.time)
-        idx = jnp.mod((t / self.dt).astype(jnp.int32) + state.obs_carry,
-                      self.com_arr.array.shape[1])
-        com = self.com_arr.array[:, idx]       # (1,1,3)
+        t = jnp.atleast_1d(state.physics_state.data.time)
+        idx = jnp.mod((t / self.dt).astype(jnp.int32) + state.obs_carry, self.com_arr.array.shape[1])
+        com = self.com_arr.array[:, idx]  # (1,1,3)
         return com.reshape(-1), state.obs_carry
+
     def initial_carry(self, _, rng):
         return jax.random.randint(rng, (1,), 0, self.com_arr.array.shape[1], jnp.int32)
-    
+
 
 @attrs.define(frozen=True)
 class ReferenceMotionReward(ksim.Reward):
     """Reward for tracking the reference motion."""
 
     reference_motion_obs_name: str = attrs.field(default="time_dependent_reference_motion_observation")
-    joint_scales: tuple[float, ...] = attrs.field(default=
-    (1.0, 1.0, 1.0, 1.0, 1.0,
-     1.0, 1.0, 1.0, 1.0, 1.0,
-     0.5, 0.5, 0.5, 0.5, 0.5,
-     0.5, 0.5, 0.5, 0.5, 0.5))
+    joint_scales: tuple[float, ...] = attrs.field(
+        default=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5)
+    )
 
     def get_reward(self, trajectory: ksim.Trajectory) -> Array:
         reference_motion = trajectory.obs[self.reference_motion_obs_name]
@@ -366,8 +364,8 @@ class MimicJointOrientationReward(ksim.Reward):
         cur = traj.obs[self.quat_cur_name]
 
         err = jnp.linalg.norm(ref - cur, axis=-1)
-        r   = jnp.exp(-2.0 * err)
-        return jnp.broadcast_to(r, traj.done.shape)        # 1-liner broadcast
+        r = jnp.exp(-2.0 * err)
+        return jnp.broadcast_to(r, traj.done.shape)  # 1-liner broadcast
 
 
 # ---------- 2. joint-angular-velocity --------------------------------------
@@ -381,17 +379,17 @@ class MimicJointVelocityReward(ksim.Reward):
         cur = traj.obs[self.vel_cur_name]
 
         err = jnp.linalg.norm(ref - cur, axis=-1)
-        r   = jnp.exp(-0.1 * err)
+        r = jnp.exp(-0.1 * err)
         return jnp.broadcast_to(r, traj.done.shape)
 
 
 # ---------- 3. end-effector pose -------------------------------------------
 @attrs.define(frozen=True)
 class MimicEEPoseReward(ksim.Reward):
-    left_hand_body_id:  int
+    left_hand_body_id: int
     right_hand_body_id: int
     ref_ee_name: str = "time_dependent_ref_eepos"
-    alpha: float = 10.0          # tracking sharpness, not a global weight
+    alpha: float = 10.0  # tracking sharpness, not a global weight
 
     @property
     def ee_ids(self):
@@ -401,20 +399,20 @@ class MimicEEPoseReward(ksim.Reward):
         if self.ref_ee_name not in traj.obs:
             return jnp.zeros(traj.done.shape)
 
-        root_pos = traj.xpos[..., 0, :]                             # (B,3)
-        ee_cur   = traj.xpos[..., self.ee_ids, :] - root_pos[:, None, :]
-        ee_ref   = traj.obs[self.ref_ee_name].reshape(*ee_cur.shape)
+        root_pos = traj.xpos[..., 0, :]  # (B,3)
+        ee_cur = traj.xpos[..., self.ee_ids, :] - root_pos[:, None, :]
+        ee_ref = traj.obs[self.ref_ee_name].reshape(*ee_cur.shape)
 
-        error = jnp.linalg.norm(ee_ref - ee_cur, axis=-1).mean(-1)    # (B,)
-        r   = jnp.exp(-self.alpha * error)                            # no extra scale
+        error = jnp.linalg.norm(ee_ref - ee_cur, axis=-1).mean(-1)  # (B,)
+        r = jnp.exp(-self.alpha * error)  # no extra scale
         return jnp.broadcast_to(r, traj.done.shape)
 
 
 # ---------- 4. centre-of-mass (root) tracking ------------------------------
 @attrs.define(frozen=True)
 class MimicCOMReward(ksim.Reward):
-    ref_com_name: str = "time_dependent_ref_com"      # reference traj key
-    cur_com_name: str = "base_position_observation"   # current robot root pos
+    ref_com_name: str = "time_dependent_ref_com"  # reference traj key
+    cur_com_name: str = "base_position_observation"  # current robot root pos
 
     def get_reward(self, traj: ksim.Trajectory) -> Array:
         # make sure both obs exist
@@ -422,11 +420,12 @@ class MimicCOMReward(ksim.Reward):
             return jnp.zeros(traj.done.shape)
 
         ref = traj.obs[self.ref_com_name].reshape(*traj.obs[self.cur_com_name].shape)
-        cur = traj.obs[self.cur_com_name]                       # (B,3)
+        cur = traj.obs[self.cur_com_name]  # (B,3)
 
-        err = jnp.linalg.norm(ref - cur, axis=-1)               # (B,)
-        r   = jnp.exp(-10.0 * err)
+        err = jnp.linalg.norm(ref - cur, axis=-1)  # (B,)
+        r = jnp.exp(-10.0 * err)
         return jnp.broadcast_to(r, traj.done.shape)
+
 
 class Actor(eqx.Module):
     """Actor for the walking task."""
@@ -616,17 +615,15 @@ class Model(eqx.Module):
 class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
     def __init__(self, config: HumanoidWalkingTaskConfig) -> None:
         super().__init__(config)
-        
+
         # Get hand body IDs - needed for computing hand positions in motion data
         self.mj_model = self.get_mujoco_model()
         self.hinge_axes = self._get_joint_axes_in_order(self.mj_model)
         self.hand_left_id = ksim.get_body_data_idx_from_name(self.mj_model, LEFT_HAND_BODY_NAME)
         self.hand_right_id = ksim.get_body_data_idx_from_name(self.mj_model, RIGHT_HAND_BODY_NAME)
 
-        self.real_motion = self.get_real_motions(self.mj_model)   # FrozenDict with qpos/quat/omega/hand_pos
+        self.real_motion = self.get_real_motions(self.mj_model)  # FrozenDict with qpos/quat/omega/hand_pos
         self.cycle_period = self.real_motion["qpos"].shape[1] * self.config.ctrl_dt
-
-
 
     def get_optimizer(self) -> optax.GradientTransformation:
         return (
@@ -646,17 +643,16 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         if metadata.actuator_type_to_metadata is None:
             raise ValueError("Actuator metadata is not available")
         return metadata
-    
+
     def _get_joint_axes_in_order(self, mj_model: mujoco.MjModel) -> jnp.ndarray:
-        """
-        Returns array shape (num_hinge, 3) whose rows are each hinge's unit axis
+        """Returns array shape (num_hinge, 3) whose rows are each hinge's unit axis
         in the **parent** frame, ordered exactly like qpos[7:] / qvel[6:].
         """
         hinge_axes = []
         for j_id in range(mj_model.njnt):
             if mj_model.jnt_type[j_id] == mujoco.mjtJoint.mjJNT_HINGE:
                 hinge_axes.append(mj_model.jnt_axis[j_id])
-        return jnp.asarray(hinge_axes)          # (num_hinge, 3)
+        return jnp.asarray(hinge_axes)  # (num_hinge, 3)
 
     def get_actuators(
         self,
@@ -672,28 +668,28 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
     def get_qpos_from_file(self, filepath: Path) -> Array:
         if filepath.suffix == ".npz":
             npz = np.load(filepath, allow_pickle=True)
-            qpos = jnp.array(npz["qpos"])[400:] # skip first 200 frames
+            qpos = jnp.array(npz["qpos"])[400:]  # skip first 200 frames
             if float(npz["frequency"]) != 1 / self.config.ctrl_dt:
                 raise ValueError(f"Motion frequency {npz['frequency']} does not match ctrl_dt {self.config.ctrl_dt}")
             return qpos
-        
-        from mujoco_animator.format import MjAnim
-        
+
+
         # Load the JSON animation file
         anim = MjAnim.load_json(filepath)
-        
+
         # Convert to numpy array with proper time stepping
         # This gives us shape (T, num_dofs) where T is number of timesteps
         qpos = anim.to_numpy(dt=self.config.ctrl_dt, interp="linear", loop=True)
-        
+
         # Verify the motion frequency matches our control timestep
         # Calculate total duration from the animation frames
         total_duration = sum(frame.length for frame in anim.frames)
         expected_frames = int(total_duration / self.config.ctrl_dt)
-        logging.info("Animation duration: %.3fs, Expected frames: %d, Actual frames: %d" % (total_duration, expected_frames, qpos.shape[0]))
+        logging.info(
+            "Animation duration: %.3fs, Expected frames: %d, Actual frames: %d"
+            % (total_duration, expected_frames, qpos.shape[0])
+        )
         return qpos
-
-            
 
     def get_real_motions(self, mj_model: mujoco.MjModel) -> PyTree:
         """Loads a trajectory from a .npz file and converts it to the (batch, T, 20) tensor expected by AMP.
@@ -702,21 +698,18 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
           • 'qpos'            –  (T, Nq)
           • optional 'frequency' –  sampling Hz (used for verification)
         """
-        
         # traj_path = Path(__file__).parent / "gaits" / "cmu_walking_91.npz"
         # traj_path = Path(__file__).parent / "gaits" / "dance_salsa.npz"
         traj_path = Path(__file__).parent / "motions" / "basic_arm.json"
-        
+
         qpos = self.get_qpos_from_file(traj_path)
 
         # npz = np.load(traj_path, allow_pickle=True)
         # qpos = jnp.array(npz["qpos"])[400:] # skip first 200 frames
 
-
         # pos_limits = ksim.get_position_limits(mj_model)
 
         # jnp.clip(arr, pos_limits)
-
 
         # if float(npz["frequency"]) != 1 / self.config.ctrl_dt:
         #     raise ValueError(f"Motion frequency {npz['frequency']} does not match ctrl_dt {self.config.ctrl_dt}")
@@ -752,18 +745,18 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             hand_pos[t, 3:6] = right_hand_rel
 
             # --- NEW: absolute hand positions (world frame) --------------------------
-            left_hand_w  = mj_data.xpos[self.hand_left_id].copy()
+            left_hand_w = mj_data.xpos[self.hand_left_id].copy()
             right_hand_w = mj_data.xpos[self.hand_right_id].copy()
-            hand_abs[t, 0:3] = left_hand_w          # (T,6)
+            hand_abs[t, 0:3] = left_hand_w  # (T,6)
             hand_abs[t, 3:6] = right_hand_w
 
             # --- NEW: centre-of-mass position (world) --------------------------------
-            com_world[t] = mj_data.subtree_com[0]    # (T,3)
+            com_world[t] = mj_data.subtree_com[0]  # (T,3)
 
         # Convert to jax array and add batch dimension
         hand_pos = jnp.array(hand_pos)[None]
-        hand_abs  = jnp.array(hand_abs)[None]     # (1,T,6)
-        com_world = jnp.array(com_world)[None]    # (1,T,3)
+        hand_abs = jnp.array(hand_abs)[None]  # (1,T,6)
+        com_world = jnp.array(com_world)[None]  # (1,T,3)
 
         joint_limits = ksim.get_position_limits(mj_model)
         joint_names = ksim.get_joint_names_in_order(mj_model)
@@ -803,46 +796,43 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         # -----------------------------------------------------------
         # 1.  finite-difference to get hinge angular speed θ̇  (rad/s)
         dt = self.config.ctrl_dt
-        qvel_joints = jnp.zeros_like(qpos_joints).at[1:].set(
-            (qpos_joints[1:] - qpos_joints[:-1]) / dt
-        )  # shape (T, J)
+        qvel_joints = jnp.zeros_like(qpos_joints).at[1:].set((qpos_joints[1:] - qpos_joints[:-1]) / dt)  # shape (T, J)
 
         # 2.  broadcast helpers across (T,J)
         #     self.hinge_axes  : (J, 3)  – collect once in __init__
-        quat_T_J_4  = hinge_angle_to_quat(
-            qpos_joints,        # (T, J, 1)
-            self.hinge_axes               # (J, 3)
-        )                                  # -> (T, J, 4)
+        quat_T_J_4 = hinge_angle_to_quat(
+            qpos_joints,  # (T, J, 1)
+            self.hinge_axes,  # (J, 3)
+        )  # -> (T, J, 4)
 
         omega_T_J_3 = hinge_speed_to_omega(
-            qvel_joints,        # (T, J, 1)
-            self.hinge_axes               # (J, 3)
-        )                                  # -> (T, J, 3)
-
+            qvel_joints,  # (T, J, 1)
+            self.hinge_axes,  # (J, 3)
+        )  # -> (T, J, 3)
 
         # 3.  add batch dim
-        quat  = quat_T_J_4[None]           # (1, T, J, 4)
-        omega = omega_T_J_3[None]          # (1, T, J, 3)
+        quat = quat_T_J_4[None]  # (1, T, J, 4)
+        omega = omega_T_J_3[None]  # (1, T, J, 3)
         # -----------------------------------------------------------
 
         # add batch dim to qpos & hand_pos just like you already do
-        qpos      = qpos[None]             # (1, T, Nq)
+        qpos = qpos[None]  # (1, T, Nq)
         # hand_pos  = jnp.array(hand_pos)[None]
-
-
 
         # --------------------------------------------
         # Return everything the rest of your pipeline
         # might need (old + new keys)
         # --------------------------------------------
-        return xax.FrozenDict({
-            "qpos"      : qpos,      # (1, T, Nq)
-            "hand_pos"  : hand_pos,  # (1, T, 6) - root-relative
-            "hand_abs"  : hand_abs,  # (1, T, 6) - absolute world frame
-            "quat"      : quat,      # (1, T, J, 4)   ### NEW
-            "omega"     : omega,     # (1, T, J, 3)   ### NEW
-            "com"       : com_world, # (1, T, 3) - center of mass world frame
-        })
+        return xax.FrozenDict(
+            {
+                "qpos": qpos,  # (1, T, Nq)
+                "hand_pos": hand_pos,  # (1, T, 6) - root-relative
+                "hand_abs": hand_abs,  # (1, T, 6) - absolute world frame
+                "quat": quat,  # (1, T, J, 4)   ### NEW
+                "omega": omega,  # (1, T, J, 3)   ### NEW
+                "com": com_world,  # (1, T, 3) - center of mass world frame
+            }
+        )
 
     def motion_to_qpos(self, motion: PyTree) -> Array:
         """Converts a motion to `qpos` array.
@@ -951,14 +941,14 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             ksim.StayAliveReward(scale=10.0),
             # ReferenceMotionReward(scale=1.0),
             # ----- Deep-Mimic imitation terms (now split) ----------------------
-            MimicJointOrientationReward(scale=0.65),                 # pose   w = 0.65
-            MimicJointVelocityReward(scale=0.10),                    # velocity w = 0.10
-            MimicEEPoseReward(                                       
+            MimicJointOrientationReward(scale=0.65),  # pose   w = 0.65
+            MimicJointVelocityReward(scale=0.10),  # velocity w = 0.10
+            MimicEEPoseReward(
                 left_hand_body_id=self.hand_left_id,
                 right_hand_body_id=self.hand_right_id,
-                scale=0.15,                                          # EE       w = 0.15
+                scale=0.15,  # EE       w = 0.15
             ),
-            MimicCOMReward(scale=0.10),                              # COM      w = 0.10
+            MimicCOMReward(scale=0.10),  # COM      w = 0.10
             # # Standard rewards.
             # ksim.NaiveForwardReward(clip_max=1.25, in_robot_frame=False, scale=3.0),
             # ksim.NaiveForwardOrientationReward(scale=1.0),
@@ -1020,7 +1010,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         ref_motion = observations["time_dependent_reference_motion_observation"]
 
         obs = [
-            phase_1,        # 1
+            phase_1,  # 1
             joint_pos_n,  # NUM_JOINTS
             joint_vel_n,  # NUM_JOINTS
             proj_grav_3,  # 3
@@ -1054,12 +1044,12 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         act_frc_obs_n = observations["actuator_force_observation"]
         base_pos_3 = observations["base_position_observation"]
         base_quat_4 = observations["base_orientation_observation"]
-        
+
         ref_motion = observations["time_dependent_reference_motion_observation"]
 
         obs_n = jnp.concatenate(
             [
-                phase_1,           # 1
+                phase_1,  # 1
                 dh_joint_pos_j,  # NUM_JOINTS
                 dh_joint_vel_j / 10.0,  # NUM_JOINTS
                 com_inertia_n,  # 160
@@ -1181,6 +1171,6 @@ if __name__ == "__main__":
             render_track_body_id=0,
             # Checkpointing parameters.
             save_every_n_seconds=60,
-            render_azimuth=145.0,        
+            render_azimuth=145.0,
         ),
     )
