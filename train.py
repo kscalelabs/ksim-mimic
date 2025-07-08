@@ -22,8 +22,6 @@ import optax
 import xax
 from jaxtyping import Array, PRNGKeyArray, PyTree
 from ksim.types import PhysicsData, PhysicsModel
-from ksim.utils.mujoco import update_data_field
-from mujoco import mjx
 from mujoco_animator.format import MjAnim
 
 
@@ -336,32 +334,42 @@ class TimeDependentRefCOM(ksim.StatefulObservation):
         return jax.random.randint(rng, (1,), 0, self.com_arr.array.shape[1], jnp.int32)
 
 
-@attrs.define(frozen=True, kw_only=True)
-class ReferenceStateInitReset(ksim.Reset):
-    """DeepMimic-style RSI that matches qpos/qvel sizes to the model."""
+def safe_set_data_field(data: PhysicsData, name: str, value: Array) -> PhysicsData:
+    """Like ksim.update_data_field, but works for both mjx.Data and MjData."""
+    if hasattr(data, "replace"):  # mjx.Data → immutable pytree
+        return data.replace(**{name: value})
+    else:  # mujoco.MjData → mutable struct
+        setattr(data, name, np.asarray(value, dtype=data.qpos.dtype))
+        return data
 
-    qpos_arr: xax.HashableArray  # (1, T, nq)
-    qvel_arr: xax.HashableArray  # (1, T, nv)
+
+@attrs.define(frozen=True, kw_only=True)
+class RandomMotionFrameReset(ksim.Reset):
+    """Initialises qpos/qvel from a random frame of the reference motion."""
+
+    # Stored as static Python tuples – no HashableArray ↔ no PyTree hashing!
+    positions: tuple[tuple[float, ...], ...]  # (T, nq)
+    velocities: tuple[tuple[float, ...], ...]  # (T, nv)
     dt: float
+    reset_pos: bool = False  # keep free-joint if False
 
     @classmethod
     def create(
         cls,
         *,
-        motion: xax.FrozenDict,
+        motion: xax.FrozenDict,  # contains "qpos" (1,T,nq)
         physics_model: PhysicsModel,
         dt: float,
-    ) -> "ReferenceStateInitReset":
-        """Motion must contain 'qpos' (1,T,nq).  We build zeros for nv."""
-        qpos = motion["qpos"]  # (1,T,nq)
-        nv = int(getattr(physics_model, "nv"))  # joint-vel length
-        T = qpos.shape[1]
-        qvel = jnp.zeros((1, T, nv), dtype=qpos.dtype)  # simple zero vels
-        return cls(
-            qpos_arr=xax.HashableArray(qpos),
-            qvel_arr=xax.HashableArray(qvel),
-            dt=dt,
-        )
+        reset_pos: bool = False,
+    ) -> "RandomMotionFrameReset":
+        qpos = np.asarray(motion["qpos"][0])  # (T, nq)
+        nv = int(physics_model.nv)
+        qvel = np.zeros((qpos.shape[0], nv), qpos.dtype)  # zero ω/ẋ
+
+        # convert to nested tuples ⇒ static / hashable
+        pos_tuple = tuple(map(tuple, qpos.tolist()))
+        vel_tuple = tuple(map(tuple, qvel.tolist()))
+        return cls(positions=pos_tuple, velocities=vel_tuple, dt=float(dt), reset_pos=reset_pos)
 
     def __call__(
         self,
@@ -369,18 +377,28 @@ class ReferenceStateInitReset(ksim.Reset):
         curriculum_level: Array,
         rng: PRNGKeyArray,
     ) -> PhysicsData:
-        T = self.qpos_arr.array.shape[1]
-        idx = jax.random.randint(rng, (), 0, T)
+        # convert back to JAX arrays (cheap – happens once per reset)
+        pos_arr = jnp.asarray(self.positions)
+        vel_arr = jnp.asarray(self.velocities)
 
-        data = update_data_field(data, "qpos", self.qpos_arr.array[0, idx])
-        data = update_data_field(data, "qvel", self.qvel_arr.array[0, idx])
+        frame = jax.random.randint(rng, (), 0, pos_arr.shape[0])
 
-        # Handle time assignment for both MjData and mjx.Data
-        new_time = idx.astype(jnp.float32) * self.dt
-        if isinstance(data, mjx.Data):  # training (JAX) path
-            data = update_data_field(data, "time", new_time)
-        else:  # viewer path (MjData, eager)
-            data.time = float(new_time)
+        # slice reference frame
+        qpos_ref = pos_arr[frame]
+        qvel_ref = vel_arr[frame]
+
+        # keep or overwrite the free joint
+        if self.reset_pos:
+            new_qpos = qpos_ref
+        else:
+            new_qpos = jnp.concatenate([data.qpos[:7], qpos_ref[7:]])
+
+        data = safe_set_data_field(data, "qpos", new_qpos)
+        data = safe_set_data_field(data, "qvel", qvel_ref)
+
+        # always set time in a JIT-friendly way
+        new_time = frame.astype(jnp.float32) * self.dt
+        data = safe_set_data_field(data, "time", new_time)
 
         return data
 
@@ -925,11 +943,13 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
     def get_resets(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reset]:
         return [
             # ksim.RandomJointPositionReset.create(physics_model, {k: v for k, v in ZEROS}, scale=0.1),
-            ReferenceStateInitReset.create(
-                motion=self.real_motion,
+            RandomMotionFrameReset.create(
+                motion=self.real_motion,  # already loaded
                 physics_model=physics_model,
                 dt=self.config.ctrl_dt,
+                reset_pos=False,  # keep root pose
             ),
+            # ksim.RandomJointPositionReset.create(physics_model, {k: v for k in ZEROS}, scale=0.1),
             ksim.RandomJointVelocityReset(),
         ]
 
