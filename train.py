@@ -21,6 +21,8 @@ import numpy as np
 import optax
 import xax
 from jaxtyping import Array, PRNGKeyArray, PyTree
+from ksim.types import PhysicsData, PhysicsModel
+from ksim.utils.mujoco import update_data_field
 from mujoco_animator.format import MjAnim
 
 
@@ -331,6 +333,49 @@ class TimeDependentRefCOM(ksim.StatefulObservation):
 
     def initial_carry(self, _, rng):
         return jax.random.randint(rng, (1,), 0, self.com_arr.array.shape[1], jnp.int32)
+
+
+@attrs.define(frozen=True, kw_only=True)
+class ReferenceStateInitReset(ksim.Reset):
+    """DeepMimic-style RSI that matches qpos/qvel sizes to the model."""
+
+    qpos_arr: xax.HashableArray  # (1, T, nq)
+    qvel_arr: xax.HashableArray  # (1, T, nv)
+    dt: float
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        motion: xax.FrozenDict,
+        physics_model: PhysicsModel,
+        dt: float,
+    ) -> "ReferenceStateInitReset":
+        """Motion must contain 'qpos' (1,T,nq).  We build zeros for nv."""
+        qpos = motion["qpos"]  # (1,T,nq)
+        nv = int(getattr(physics_model, "nv"))  # joint-vel length
+        T = qpos.shape[1]
+        qvel = jnp.zeros((1, T, nv), dtype=qpos.dtype)  # simple zero vels
+        return cls(
+            qpos_arr=xax.HashableArray(qpos),
+            qvel_arr=xax.HashableArray(qvel),
+            dt=dt,
+        )
+
+    def __call__(
+        self,
+        data: PhysicsData,
+        curriculum_level: Array,
+        rng: PRNGKeyArray,
+    ) -> PhysicsData:
+        T = self.qpos_arr.array.shape[1]
+        idx = jax.random.randint(rng, (), 0, T)
+
+        data = update_data_field(data, "qpos", self.qpos_arr.array[0, idx])
+        data = update_data_field(data, "qvel", self.qvel_arr.array[0, idx])
+        # safe time assignment
+        data.time = float(idx) * self.dt
+        return data
 
 
 @attrs.define(frozen=True)
@@ -673,7 +718,6 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 raise ValueError(f"Motion frequency {npz['frequency']} does not match ctrl_dt {self.config.ctrl_dt}")
             return qpos
 
-
         # Load the JSON animation file
         anim = MjAnim.load_json(filepath)
 
@@ -873,7 +917,12 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
 
     def get_resets(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reset]:
         return [
-            ksim.RandomJointPositionReset.create(physics_model, {k: v for k, v in ZEROS}, scale=0.1),
+            # ksim.RandomJointPositionReset.create(physics_model, {k: v for k, v in ZEROS}, scale=0.1),
+            ReferenceStateInitReset.create(
+                motion=self.real_motion,
+                physics_model=physics_model,
+                dt=self.config.ctrl_dt,
+            ),
             ksim.RandomJointVelocityReset(),
         ]
 
