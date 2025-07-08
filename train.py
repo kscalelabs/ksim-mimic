@@ -1059,9 +1059,9 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
     def get_model(self, key: PRNGKeyArray) -> Model:
         return Model(
             key,
-            num_actor_inputs=50 if self.config.use_acc_gyro else 44,
+            num_actor_inputs=(50 if self.config.use_acc_gyro else 44) + 20,
             num_actor_outputs=len(ZEROS),
-            num_critic_inputs=445,
+            num_critic_inputs=(445 if self.config.use_acc_gyro else 401) + 20,
             min_std=0.001,
             max_std=1.0,
             var_scale=self.config.var_scale,
@@ -1083,7 +1083,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         proj_grav_3 = observations["projected_gravity_observation"]
         imu_acc_3 = observations["sensor_observation_imu_acc"]
         imu_gyro_3 = observations["sensor_observation_imu_gyro"]
-        ref_motion = observations["time_dependent_reference_motion_observation"]
+        ref_motion = observations["time_dependent_reference_motion_observation"].squeeze(-1) # (20,)
 
         obs = [
             phase_1,  # 1
@@ -1096,6 +1096,10 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 imu_acc_3,  # 3
                 imu_gyro_3,  # 3
             ]
+
+        obs += [
+            ref_motion,  # (NUM_JOINTS)
+        ]
 
         obs_n = jnp.concatenate(obs, axis=-1)
         action, carry = model.forward(obs_n, carry)
@@ -1121,7 +1125,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         base_pos_3 = observations["base_position_observation"]
         base_quat_4 = observations["base_orientation_observation"]
 
-        ref_motion = observations["time_dependent_reference_motion_observation"]
+        ref_motion = observations["time_dependent_reference_motion_observation"].squeeze(-1) # (20,)
 
         obs_n = jnp.concatenate(
             [
@@ -1136,6 +1140,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 act_frc_obs_n / 100.0,  # NUM_JOINTS
                 base_pos_3,  # 3
                 base_quat_4,  # 4
+                ref_motion,  # (NUM_JOINTS)
             ],
             axis=-1,
         )
