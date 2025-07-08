@@ -58,7 +58,7 @@ def _get_joint_axes_in_order(mj_model: mujoco.MjModel) -> jnp.ndarray:
 
 
 # These are in the order of the neural network outputs.
-ZEROS: list[tuple[str, float]] = [
+JOINT_BIASES: list[tuple[str, float]] = [
     ("dof_right_shoulder_pitch_03", 0.0),
     ("dof_right_shoulder_roll_03", 0.0),
     ("dof_right_shoulder_yaw_02", 0.0),
@@ -81,6 +81,31 @@ ZEROS: list[tuple[str, float]] = [
     ("dof_left_ankle_02", 0.0),
 ]
 
+# These are in the order of the neural network outputs.
+JOINT_MOTION_WEIGHTS: list[tuple[str, float]] = [
+    ("dof_right_shoulder_pitch_03", 1.0),
+    ("dof_right_shoulder_roll_03", 100.0),
+    ("dof_right_shoulder_yaw_02", 1.0),
+    ("dof_right_elbow_02", 1.0),
+    ("dof_right_wrist_00", 1.0),
+    ("dof_left_shoulder_pitch_03", 1.0),
+    ("dof_left_shoulder_roll_03", 1.0),
+    ("dof_left_shoulder_yaw_02", 1.0),
+    ("dof_left_elbow_02", 1.0),
+    ("dof_left_wrist_00", 1.0),
+    ("dof_right_hip_pitch_04", 1.0),
+    ("dof_right_hip_roll_03", 1.0),
+    ("dof_right_hip_yaw_03", 1.0),
+    ("dof_right_knee_04", 1.0),
+    ("dof_right_ankle_02", 1.0),
+    ("dof_left_hip_pitch_04", 1.0),
+    ("dof_left_hip_roll_03", 1.0),
+    ("dof_left_hip_yaw_03", 1.0),
+    ("dof_left_knee_04", 1.0),
+    ("dof_left_ankle_02", 1.0),
+]
+
+JOINT_WEIGHT_ARRAY = jnp.asarray([w for _, w in JOINT_MOTION_WEIGHTS])
 
 # Hand body names for computing hand positions
 LEFT_HAND_BODY_NAME = "KB_C_501X_Left_Bayonet_Adapter_Hard_Stop"
@@ -134,7 +159,7 @@ class JointPositionPenalty(ksim.JointDeviationPenalty):
         scale: float = -1.0,
         scale_by_curriculum: bool = False,
     ) -> Self:
-        zeros = {k: v for k, v in ZEROS}
+        zeros = {k: v for k, v in JOINT_BIASES}
         joint_targets = [zeros[name] for name in names]
 
         return cls.create(
@@ -428,28 +453,51 @@ class ReferenceMotionReward(ksim.Reward):
 class MimicJointOrientationReward(ksim.Reward):
     quat_ref_name: str = "time_dependent_ref_quat"
     quat_cur_name: str = "current_quat_observation"
+    joint_weights: xax.HashableArray = attrs.field(default=xax.HashableArray(JOINT_WEIGHT_ARRAY))
 
     def get_reward(self, traj: ksim.Trajectory) -> Array:
-        ref = traj.obs[self.quat_ref_name].reshape(*traj.obs[self.quat_cur_name].shape)
-        cur = traj.obs[self.quat_cur_name]
+        # reshape into (B, J, 4) instead of the old flat vector
+        ref = traj.obs[self.quat_ref_name].reshape(traj.done.shape[0], 20, 4)
+        cur = traj.obs[self.quat_cur_name].reshape(traj.done.shape[0], 20, 4)
 
-        err = jnp.linalg.norm(ref - cur, axis=-1)
-        r = jnp.exp(-2.0 * err)
-        return jnp.broadcast_to(r, traj.done.shape)  # 1-liner broadcast
+        # per-joint error (B, J)
+        per_joint_err = jnp.linalg.norm(ref - cur, axis=-1)  # e_j
+
+        # turn each joint’s error into a score first
+        per_joint_score = jnp.exp(-2.0 * per_joint_err)  # α ≈ 2 originally
+
+        # now weight the score, not the exponent
+        weighted = per_joint_score * self.joint_weights.array  # w_j
+
+        # aggregate – e.g. mean or sum
+        r = weighted.mean(-1)  # (B,)
+        return jnp.broadcast_to(r, traj.done.shape)
 
 
 # ---------- 2. joint-angular-velocity --------------------------------------
+
+
 @attrs.define(frozen=True)
 class MimicJointVelocityReward(ksim.Reward):
     vel_ref_name: str = "time_dependent_ref_vel"
     vel_cur_name: str = "current_joint_velocity_observation"
+    joint_weights: xax.HashableArray = attrs.field(default=xax.HashableArray(JOINT_WEIGHT_ARRAY))
 
     def get_reward(self, traj: ksim.Trajectory) -> Array:
-        ref = traj.obs[self.vel_ref_name].reshape(*traj.obs[self.vel_cur_name].shape)
-        cur = traj.obs[self.vel_cur_name]
+        ref = traj.obs[self.vel_ref_name].reshape(traj.done.shape[0], 20, 3)
+        cur = traj.obs[self.vel_cur_name].reshape(traj.done.shape[0], 20, 3)
 
-        err = jnp.linalg.norm(ref - cur, axis=-1)
-        r = jnp.exp(-0.1 * err)
+        # per-joint error (B, J)
+        per_joint_err = jnp.linalg.norm(ref - cur, axis=-1)  # e_j
+
+        # turn each joint’s error into a score first
+        per_joint_score = jnp.exp(-0.1 * per_joint_err)  # α ≈ 2 originally
+
+        # now weight the score, not the exponent
+        weighted = per_joint_score * self.joint_weights.array  # w_j
+
+        # aggregate – e.g. mean or sum
+        r = weighted.mean(-1)  # (B,)
         return jnp.broadcast_to(r, traj.done.shape)
 
 
@@ -577,7 +625,7 @@ class Actor(eqx.Module):
         std_nm = jnp.clip((jax.nn.softplus(std_nm) + self.min_std) * self.var_scale, max=self.max_std)
 
         # Apply bias to the means.
-        mean_nm = mean_nm + jnp.array([v for _, v in ZEROS])[:, None]
+        mean_nm = mean_nm + jnp.array([v for _, v in JOINT_BIASES])[:, None]
 
         dist_n = ksim.MixtureOfGaussians(means_nm=mean_nm, stds_nm=std_nm, logits_nm=logits_nm)
 
@@ -694,6 +742,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
 
         self.real_motion = self.get_real_motions(self.mj_model)  # FrozenDict with qpos/quat/omega/hand_pos
         self.cycle_period = self.real_motion["qpos"].shape[1] * self.config.ctrl_dt
+        self.motion_weights = xax.HashableArray(JOINT_WEIGHT_ARRAY)
 
     def get_optimizer(self) -> optax.GradientTransformation:
         return (
@@ -1017,8 +1066,8 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             ksim.StayAliveReward(scale=10.0),
             # ReferenceMotionReward(scale=1.0),
             # ----- Deep-Mimic imitation terms (now split) ----------------------
-            MimicJointOrientationReward(scale=0.65),  # pose   w = 0.65
-            MimicJointVelocityReward(scale=0.10),  # velocity w = 0.10
+            MimicJointOrientationReward(scale=0.65, joint_weights=self.motion_weights),
+            MimicJointVelocityReward(scale=0.10, joint_weights=self.motion_weights),
             MimicEEPoseReward(
                 left_hand_body_id=self.hand_left_id,
                 right_hand_body_id=self.hand_right_id,
@@ -1060,7 +1109,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         return Model(
             key,
             num_actor_inputs=(50 if self.config.use_acc_gyro else 44) + 20,
-            num_actor_outputs=len(ZEROS),
+            num_actor_outputs=len(JOINT_BIASES),
             num_critic_inputs=(445 if self.config.use_acc_gyro else 401) + 20,
             min_std=0.001,
             max_std=1.0,
@@ -1083,7 +1132,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         proj_grav_3 = observations["projected_gravity_observation"]
         imu_acc_3 = observations["sensor_observation_imu_acc"]
         imu_gyro_3 = observations["sensor_observation_imu_gyro"]
-        ref_motion = observations["time_dependent_reference_motion_observation"].squeeze(-1) # (20,)
+        ref_motion = observations["time_dependent_reference_motion_observation"].squeeze(-1)  # (20,)
 
         obs = [
             phase_1,  # 1
@@ -1125,7 +1174,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         base_pos_3 = observations["base_position_observation"]
         base_quat_4 = observations["base_orientation_observation"]
 
-        ref_motion = observations["time_dependent_reference_motion_observation"].squeeze(-1) # (20,)
+        ref_motion = observations["time_dependent_reference_motion_observation"].squeeze(-1)  # (20,)
 
         obs_n = jnp.concatenate(
             [
