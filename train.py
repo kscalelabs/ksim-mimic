@@ -23,6 +23,7 @@ import xax
 from jaxtyping import Array, PRNGKeyArray, PyTree
 from ksim.types import PhysicsData, PhysicsModel
 from ksim.utils.mujoco import update_data_field
+from mujoco import mjx
 from mujoco_animator.format import MjAnim
 
 
@@ -373,8 +374,14 @@ class ReferenceStateInitReset(ksim.Reset):
 
         data = update_data_field(data, "qpos", self.qpos_arr.array[0, idx])
         data = update_data_field(data, "qvel", self.qvel_arr.array[0, idx])
-        # safe time assignment
-        data.time = float(idx) * self.dt
+
+        # Handle time assignment for both MjData and mjx.Data
+        new_time = idx.astype(jnp.float32) * self.dt
+        if isinstance(data, mjx.Data):  # training (JAX) path
+            data = update_data_field(data, "time", new_time)
+        else:  # viewer path (MjData, eager)
+            data.time = float(new_time)
+
         return data
 
 
