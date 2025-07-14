@@ -105,7 +105,7 @@ JOINT_MOTION_WEIGHTS: list[tuple[str, float]] = [
     ("dof_left_ankle_02", 1.0),
 ]
 
-JOINT_WEIGHT_ARRAY = np.asarray([w for _, w in JOINT_MOTION_WEIGHTS], dtype=np.float32)
+JOINT_WEIGHT_ARRAY = jnp.asarray([w for _, w in JOINT_MOTION_WEIGHTS])
 
 # Hand body names for computing hand positions
 LEFT_HAND_BODY_NAME = "KB_C_501X_Left_Bayonet_Adapter_Hard_Stop"
@@ -451,13 +451,11 @@ class ReferenceMotionReward(ksim.Reward):
 # ---------- 1. joint-orientation (quaternion) ------------------------------
 @attrs.define(frozen=True)
 class MimicJointOrientationReward(ksim.Reward):
-    joint_weights: xax.HashableArray
     quat_ref_name: str = "time_dependent_ref_quat"
     quat_cur_name: str = "current_quat_observation"
+    joint_weights: xax.HashableArray = attrs.field(default=xax.HashableArray(JOINT_WEIGHT_ARRAY))
 
     def get_reward(self, traj: ksim.Trajectory) -> Array:
-        weights = jnp.asarray(self.joint_weights.array)
-
         # reshape into (B, J, 4) instead of the old flat vector
         ref = traj.obs[self.quat_ref_name].reshape(traj.done.shape[0], 20, 4)
         cur = traj.obs[self.quat_cur_name].reshape(traj.done.shape[0], 20, 4)
@@ -469,7 +467,7 @@ class MimicJointOrientationReward(ksim.Reward):
         per_joint_score = jnp.exp(-2.0 * per_joint_err)  # α ≈ 2 originally
 
         # now weight the score, not the exponent
-        weighted = per_joint_score * weights
+        weighted = per_joint_score * self.joint_weights.array  # w_j
 
         # aggregate – e.g. mean or sum
         r = weighted.mean(-1)  # (B,)
@@ -481,13 +479,11 @@ class MimicJointOrientationReward(ksim.Reward):
 
 @attrs.define(frozen=True)
 class MimicJointVelocityReward(ksim.Reward):
-    joint_weights: xax.HashableArray
     vel_ref_name: str = "time_dependent_ref_vel"
     vel_cur_name: str = "current_joint_velocity_observation"
+    joint_weights: xax.HashableArray = attrs.field(default=xax.HashableArray(JOINT_WEIGHT_ARRAY))
 
     def get_reward(self, traj: ksim.Trajectory) -> Array:
-        weights = jnp.asarray(self.joint_weights.array)
-
         ref = traj.obs[self.vel_ref_name].reshape(traj.done.shape[0], 20, 3)
         cur = traj.obs[self.vel_cur_name].reshape(traj.done.shape[0], 20, 3)
 
@@ -498,7 +494,7 @@ class MimicJointVelocityReward(ksim.Reward):
         per_joint_score = jnp.exp(-0.1 * per_joint_err)  # α ≈ 2 originally
 
         # now weight the score, not the exponent
-        weighted = per_joint_score * weights
+        weighted = per_joint_score * self.joint_weights.array  # w_j
 
         # aggregate – e.g. mean or sum
         r = weighted.mean(-1)  # (B,)
