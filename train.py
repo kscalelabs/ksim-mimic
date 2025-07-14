@@ -1305,6 +1305,8 @@ if __name__ == "__main__":
             render_track_body_id=0,
             # Checkpointing parameters.
             save_every_n_seconds=60,
+            render_full_every_n_seconds=300,
+            valid_every_n_seconds=300,
             render_azimuth=145.0,
         ),
     )
