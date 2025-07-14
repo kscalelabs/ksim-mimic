@@ -107,6 +107,11 @@ JOINT_MOTION_WEIGHTS: list[tuple[str, float]] = [
 
 JOINT_WEIGHT_ARRAY = jnp.asarray([w for _, w in JOINT_MOTION_WEIGHTS])
 
+# NEW – we will need these helpers
+NUM_JOINTS: int = len(JOINT_BIASES)        # 20
+NUM_ACTOR_INPUTS: int = 70  # (50 if use_acc_gyro else 44) + 20, defaulting to 50+20=70
+NUM_CRITIC_INPUTS: int = 465  # (445 if use_acc_gyro else 401) + 20, defaulting to 445+20=465
+
 # Hand body names for computing hand positions
 LEFT_HAND_BODY_NAME = "KB_C_501X_Left_Bayonet_Adapter_Hard_Stop"
 RIGHT_HAND_BODY_NAME = "KB_C_501X_Right_Bayonet_Adapter_Hard_Stop"
@@ -546,12 +551,12 @@ class MimicCOMReward(ksim.Reward):
 
 
 class Actor(eqx.Module):
-    """Actor for the walking task."""
+    """Transformer-based actor."""
 
     input_proj: eqx.nn.Linear
-    rnns: tuple[eqx.nn.GRUCell, ...]
+    transformer: xax.TransformerStack
     output_proj: eqx.nn.Linear
-    num_inputs: int = eqx.static_field()
+
     num_outputs: int = eqx.static_field()
     num_mixtures: int = eqx.static_field()
     min_std: float = eqx.static_field()
@@ -568,165 +573,143 @@ class Actor(eqx.Module):
         max_std: float,
         var_scale: float,
         hidden_size: int,
-        num_mixtures: int,
         depth: int,
-    ) -> None:
-        # Project input to hidden size
-        key, input_proj_key = jax.random.split(key)
-        self.input_proj = eqx.nn.Linear(
-            in_features=num_inputs,
-            out_features=hidden_size,
-            key=input_proj_key,
+        num_mixtures: int,
+    ):
+        key, sub = jax.random.split(key)
+        self.input_proj = eqx.nn.Linear(num_inputs, hidden_size, key=sub)
+
+        key, sub = jax.random.split(key)
+        self.transformer = xax.TransformerStack(
+            embed_dim=hidden_size,
+            num_layers=depth,
+            num_heads=hidden_size // 64,
+            ff_dim=hidden_size,
+            context_length=32,
+            key=sub,
         )
 
-        # Create RNN layer
-        key, rnn_key = jax.random.split(key)
-        rnn_keys = jax.random.split(rnn_key, depth)
-        self.rnns = tuple(
-            [
-                eqx.nn.GRUCell(
-                    input_size=hidden_size,
-                    hidden_size=hidden_size,
-                    key=rnn_key,
-                )
-                for rnn_key in rnn_keys
-            ]
-        )
-
-        # Project to output
         self.output_proj = eqx.nn.Linear(
-            in_features=hidden_size,
-            out_features=num_outputs * 3 * num_mixtures,
-            key=key,
+            hidden_size, num_outputs * 3 * num_mixtures, key=key
         )
 
-        self.num_inputs = num_inputs
         self.num_outputs = num_outputs
         self.num_mixtures = num_mixtures
         self.min_std = min_std
         self.max_std = max_std
         self.var_scale = var_scale
 
-    def forward(self, obs_n: Array, carry: Array) -> tuple[distrax.Distribution, Array]:
-        x_n = self.input_proj(obs_n)
-        out_carries = []
-        for i, rnn in enumerate(self.rnns):
-            x_n = rnn(x_n, carry[i])
-            out_carries.append(x_n)
-        out_n = self.output_proj(x_n)
+    # `carry` is an xax.TransformerCache
+    def forward(
+        self, obs_n: Array, carry: xax.TransformerCache, *, add_batch_dim: bool
+    ) -> tuple[distrax.Distribution, xax.TransformerCache]:
+        # Ensure obs_n is at least 1D and has proper shape
+        obs_n = jnp.atleast_1d(obs_n)
+        
+        # For transformer: input should be (seq_len, features)
+        # We treat each observation as a single timestep sequence
+        if obs_n.ndim == 1:
+            obs_n = obs_n[None, :]  # (1, features)
+        
+        # Apply input projection to each timestep
+        x_n = xax.vmap(self.input_proj)(obs_n)  # (seq_len, hidden_size)
+        
+        # Run through transformer
+        x_n, carry = self.transformer.forward(x_n, cache=carry)
+        
+        # Apply output projection to each timestep  
+        out_n = xax.vmap(self.output_proj)(x_n)  # (seq_len, output_features)
 
-        # Reshape the output to be a mixture of gaussians.
+        # Extract output for the last (or only) timestep in sequence
+        out_n = out_n[-1]  # (features,) - take last timestep
+        
         slice_len = self.num_outputs * self.num_mixtures
-        mean_nm = out_n[..., :slice_len].reshape(self.num_outputs, self.num_mixtures)
-        std_nm = out_n[..., slice_len : slice_len * 2].reshape(self.num_outputs, self.num_mixtures)
-        logits_nm = out_n[..., slice_len * 2 :].reshape(self.num_outputs, self.num_mixtures)
+        mean_nm   = out_n[:slice_len].reshape(self.num_outputs, self.num_mixtures)
+        std_nm    = out_n[slice_len: 2*slice_len].reshape(self.num_outputs, self.num_mixtures)
+        logits_nm = out_n[2*slice_len:].reshape(self.num_outputs, self.num_mixtures)
 
-        # Softplus and clip to ensure positive standard deviations.
-        std_nm = jnp.clip((jax.nn.softplus(std_nm) + self.min_std) * self.var_scale, max=self.max_std)
+        std_nm = jnp.clip((jax.nn.softplus(std_nm) + self.min_std) * self.var_scale,
+                          a_max=self.max_std)
+        mean_nm = mean_nm + jnp.asarray([b for _, b in JOINT_BIASES])[:, None]
 
-        # Apply bias to the means.
-        mean_nm = mean_nm + jnp.array([v for _, v in JOINT_BIASES])[:, None]
-
-        dist_n = ksim.MixtureOfGaussians(means_nm=mean_nm, stds_nm=std_nm, logits_nm=logits_nm)
-
-        return dist_n, jnp.stack(out_carries, axis=0)
+        return (
+            ksim.MixtureOfGaussians(means_nm=mean_nm, stds_nm=std_nm, logits_nm=logits_nm),
+            carry,
+        )
 
 
 class Critic(eqx.Module):
-    """Critic for the walking task."""
+    """Transformer-based critic."""
 
     input_proj: eqx.nn.Linear
-    rnns: tuple[eqx.nn.GRUCell, ...]
+    transformer: xax.TransformerStack
     output_proj: eqx.nn.Linear
-    num_inputs: int = eqx.static_field()
 
-    def __init__(
-        self,
-        key: PRNGKeyArray,
-        *,
-        num_inputs: int,
-        hidden_size: int,
-        depth: int,
-    ) -> None:
-        num_outputs = 1
+    def __init__(self, key: PRNGKeyArray, *, num_inputs: int, hidden_size: int, depth: int):
+        key, sub = jax.random.split(key)
+        self.input_proj = eqx.nn.Linear(num_inputs, hidden_size, key=sub)
 
-        # Project input to hidden size
-        key, input_proj_key = jax.random.split(key)
-        self.input_proj = eqx.nn.Linear(
-            in_features=num_inputs,
-            out_features=hidden_size,
-            key=input_proj_key,
+        key, sub = jax.random.split(key)
+        self.transformer = xax.TransformerStack(
+            embed_dim=hidden_size,
+            num_layers=depth,
+            num_heads=hidden_size // 64,
+            ff_dim=hidden_size,
+            context_length=32,
+            key=sub,
         )
 
-        # Create RNN layer
-        key, rnn_key = jax.random.split(key)
-        rnn_keys = jax.random.split(rnn_key, depth)
-        self.rnns = tuple(
-            [
-                eqx.nn.GRUCell(
-                    input_size=hidden_size,
-                    hidden_size=hidden_size,
-                    key=rnn_key,
-                )
-                for rnn_key in rnn_keys
-            ]
-        )
+        self.output_proj = eqx.nn.Linear(hidden_size, 1, key=key)
 
-        # Project to output
-        self.output_proj = eqx.nn.Linear(
-            in_features=hidden_size,
-            out_features=num_outputs,
-            key=key,
-        )
-
-        self.num_inputs = num_inputs
-
-    def forward(self, obs_n: Array, carry: Array) -> tuple[Array, Array]:
-        x_n = self.input_proj(obs_n)
-        out_carries = []
-        for i, rnn in enumerate(self.rnns):
-            x_n = rnn(x_n, carry[i])
-            out_carries.append(x_n)
-        out_n = self.output_proj(x_n)
-
-        return out_n, jnp.stack(out_carries, axis=0)
+    def forward(
+        self, obs_n: Array, carry: xax.TransformerCache, *, add_batch_dim: bool
+    ) -> tuple[Array, xax.TransformerCache]:
+        # Ensure obs_n is at least 1D and has proper shape
+        obs_n = jnp.atleast_1d(obs_n)
+        
+        # For transformer: input should be (seq_len, features)
+        # We treat each observation as a single timestep sequence
+        if obs_n.ndim == 1:
+            obs_n = obs_n[None, :]  # (1, features)
+        
+        # Apply input projection to each timestep
+        x_n = xax.vmap(self.input_proj)(obs_n)  # (seq_len, hidden_size)
+        
+        # Run through transformer
+        x_n, carry = self.transformer.forward(x_n, cache=carry)
+        
+        # Apply output projection to each timestep  
+        value = xax.vmap(self.output_proj)(x_n)  # (seq_len, 1)
+        
+        # Extract value for single timestep (take last timestep)
+        # Keep it as 1D array with shape (1,) so it can be squeezed later
+        value = value[-1]  # This should be shape (1,) from the linear layer
+        
+        return value, carry
 
 
 class Model(eqx.Module):
     actor: Actor
     critic: Critic
 
-    def __init__(
-        self,
-        key: PRNGKeyArray,
-        *,
-        num_actor_inputs: int,
-        num_actor_outputs: int,
-        num_critic_inputs: int,
-        min_std: float,
-        max_std: float,
-        var_scale: float,
-        hidden_size: int,
-        num_mixtures: int,
-        depth: int,
-    ) -> None:
-        actor_key, critic_key = jax.random.split(key)
+    def __init__(self, key: PRNGKeyArray, *, hidden_size: int, depth: int, num_mixtures: int):
+        a_key, c_key = jax.random.split(key)
         self.actor = Actor(
-            actor_key,
-            num_inputs=num_actor_inputs,
-            num_outputs=num_actor_outputs,
-            min_std=min_std,
-            max_std=max_std,
-            var_scale=var_scale,
+            a_key,
+            num_inputs=NUM_ACTOR_INPUTS,
+            num_outputs=NUM_JOINTS,
+            min_std=0.001,
+            max_std=1.0,
+            var_scale=0.5,
             hidden_size=hidden_size,
-            num_mixtures=num_mixtures,
             depth=depth,
+            num_mixtures=num_mixtures,
         )
         self.critic = Critic(
-            critic_key,
+            c_key,
+            num_inputs=NUM_CRITIC_INPUTS,
             hidden_size=hidden_size,
             depth=depth,
-            num_inputs=num_critic_inputs,
         )
 
 
@@ -1108,15 +1091,9 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
     def get_model(self, key: PRNGKeyArray) -> Model:
         return Model(
             key,
-            num_actor_inputs=(50 if self.config.use_acc_gyro else 44) + 20,
-            num_actor_outputs=len(JOINT_BIASES),
-            num_critic_inputs=(445 if self.config.use_acc_gyro else 401) + 20,
-            min_std=0.001,
-            max_std=1.0,
-            var_scale=self.config.var_scale,
             hidden_size=self.config.hidden_size,
-            num_mixtures=self.config.num_mixtures,
             depth=self.config.depth,
+            num_mixtures=self.config.num_mixtures,
         )
 
     def run_actor(
@@ -1125,6 +1102,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         observations: xax.FrozenDict[str, Array],
         commands: xax.FrozenDict[str, Array],
         carry: Array,
+        add_batch_dim: bool,
     ) -> tuple[distrax.Distribution, Array]:
         phase_1 = observations["reference_motion_phase_observation"]
         joint_pos_n = observations["joint_position_observation"]
@@ -1135,7 +1113,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         ref_motion = observations["time_dependent_reference_motion_observation"].squeeze(-1)  # (20,)
 
         obs = [
-            phase_1,  # 1
+            jnp.atleast_1d(phase_1),  # 1
             joint_pos_n,  # NUM_JOINTS
             joint_vel_n,  # NUM_JOINTS
             proj_grav_3,  # 3
@@ -1150,8 +1128,11 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             ref_motion,  # (NUM_JOINTS)
         ]
 
+        # Ensure all observation components are at least 1D before concatenation
+        obs = [jnp.atleast_1d(o) for o in obs]
         obs_n = jnp.concatenate(obs, axis=-1)
-        action, carry = model.forward(obs_n, carry)
+        
+        action, carry = model.forward(obs_n, carry, add_batch_dim=add_batch_dim)
 
         return action, carry
 
@@ -1161,6 +1142,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         observations: xax.FrozenDict[str, Array],
         commands: xax.FrozenDict[str, Array],
         carry: Array,
+        add_batch_dim: bool,
     ) -> tuple[Array, Array]:
         phase_1 = observations["reference_motion_phase_observation"]
         dh_joint_pos_j = observations["joint_position_observation"]
@@ -1176,25 +1158,26 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
 
         ref_motion = observations["time_dependent_reference_motion_observation"].squeeze(-1)  # (20,)
 
-        obs_n = jnp.concatenate(
-            [
-                phase_1,  # 1
-                dh_joint_pos_j,  # NUM_JOINTS
-                dh_joint_vel_j / 10.0,  # NUM_JOINTS
-                com_inertia_n,  # 160
-                com_vel_n,  # 96
-                imu_acc_3,  # 3
-                imu_gyro_3,  # 3
-                proj_grav_3,  # 3
-                act_frc_obs_n / 100.0,  # NUM_JOINTS
-                base_pos_3,  # 3
-                base_quat_4,  # 4
-                ref_motion,  # (NUM_JOINTS)
-            ],
-            axis=-1,
-        )
-
-        return model.forward(obs_n, carry)
+        obs_list = [
+            phase_1,  # 1
+            dh_joint_pos_j,  # NUM_JOINTS
+            dh_joint_vel_j / 10.0,  # NUM_JOINTS
+            com_inertia_n,  # 160
+            com_vel_n,  # 96
+            imu_acc_3,  # 3
+            imu_gyro_3,  # 3
+            proj_grav_3,  # 3
+            act_frc_obs_n / 100.0,  # NUM_JOINTS
+            base_pos_3,  # 3
+            base_quat_4,  # 4
+            ref_motion,  # (NUM_JOINTS)
+        ]
+        
+        # Ensure all observation components are at least 1D before concatenation
+        obs_list = [jnp.atleast_1d(o) for o in obs_list]
+        obs_n = jnp.concatenate(obs_list, axis=-1)
+        
+        return model.forward(obs_n, carry, add_batch_dim=add_batch_dim)
 
     def _model_scan_fn(
         self,
@@ -1210,6 +1193,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             observations=transition.obs,
             commands=transition.command,
             carry=actor_carry,
+            add_batch_dim=False,
         )
 
         # Gets the log probabilities of the action.
@@ -1221,6 +1205,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             observations=transition.obs,
             commands=transition.command,
             carry=critic_carry,
+            add_batch_dim=False,
         )
 
         transition_ppo_variables = ksim.PPOVariables(
@@ -1230,7 +1215,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
 
         next_carry = jax.tree.map(
             lambda x, y: jnp.where(transition.done, x, y),
-            self.get_initial_model_carry(rng),
+            self.get_initial_model_carry(model, rng),
             (next_actor_carry, next_critic_carry),
         )
 
@@ -1252,10 +1237,12 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         )
         return ppo_variables, next_model_carry
 
-    def get_initial_model_carry(self, rng: PRNGKeyArray) -> tuple[Array, Array]:
+    def get_initial_model_carry(
+        self, model: Model, rng: PRNGKeyArray
+    ) -> tuple[xax.TransformerCache, xax.TransformerCache]:
         return (
-            jnp.zeros(shape=(self.config.depth, self.config.hidden_size)),
-            jnp.zeros(shape=(self.config.depth, self.config.hidden_size)),
+            model.actor.transformer.init_cache(dtype=jnp.float32),
+            model.critic.transformer.init_cache(dtype=jnp.float32),
         )
 
     def sample_action(
@@ -1275,6 +1262,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             observations=observations,
             commands=commands,
             carry=actor_carry_in,
+            add_batch_dim=True,
         )
         action_j = action_dist_j.mode() if argmax else action_dist_j.sample(seed=rng)
         return ksim.Action(action=action_j, carry=(actor_carry, critic_carry_in))
@@ -1284,8 +1272,8 @@ if __name__ == "__main__":
     HumanoidWalkingTask.launch(
         HumanoidWalkingTaskConfig(
             # Training parameters.
-            num_envs=2048,
-            batch_size=256,
+            num_envs=32,
+            batch_size=32,
             num_passes=4,
             epochs_per_log_step=1,
             rollout_length_seconds=8.0,
